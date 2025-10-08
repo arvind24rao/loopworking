@@ -1,0 +1,280 @@
+import os
+import time
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import ORJSONResponse
+from loguru import logger
+
+# keep the old ping import for later, but we won't use it right now
+from app.db import ping_db
+from app.models import InboxRequest, InboxResponse, MessagesResponse, MessageOut, PublishRequest, PublishResponse
+from app.crypto import encrypt_plaintext
+from app.supa import supa  # NEW: REST client
+
+# Load env from project root (.env.dev lives in /Users/arvindrao/loop)
+ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT / ".env.dev")
+
+ENV = os.getenv("ENV", "dev")
+PORT = int(os.getenv("PORT", "8080"))
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+AUTH_MODE = os.getenv("AUTH_MODE", "service")
+LOOP_BOT_USER_ID = os.getenv("LOOP_BOT_USER_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+app = FastAPI(title="loop-mvp-api", default_response_class=ORJSONResponse)
+
+@app.get("/health")
+def health():
+    # We still attempt DB ping, but treat REST reachability as primary for now.
+    t0 = time.time()
+    db_ok = True
+    try:
+        ping_db()
+    except Exception as e:
+        db_ok = False
+        logger.error("DB ping failed (expected if DNS/IPv6 issue): {}", e)
+
+    # check REST quickly
+    rest_ok = True
+    try:
+        # list zero rows from an existing table to validate REST; threads exists from earlier SQL
+        item = supa.select_one("threads", {"id": "00000000-0000-0000-0000-000000000000"}, select="id")
+        # returns None or a dict; either means endpoint worked
+    except Exception as e:
+        rest_ok = False
+        logger.error("REST ping failed: {}", e)
+
+    return {
+        "status": "ok" if rest_ok else ("degraded" if db_ok else "down"),
+        "env": ENV,
+        "auth_mode": AUTH_MODE,
+        "has_service_key": bool(SUPABASE_SERVICE_ROLE_KEY),
+        "has_supabase_url": bool(SUPABASE_URL),
+        "has_database_url": bool(DATABASE_URL),
+        "bot_user_id_set": bool(LOOP_BOT_USER_ID),
+        "rest_ok": rest_ok,
+        "db_ok": db_ok,
+        "latency_ms": int((time.time() - t0) * 1000),
+    }
+
+@app.post("/messages/inbox", response_model=InboxResponse, status_code=201)
+def inbox_message(payload: InboxRequest, x_user_id: Optional[str] = Header(default=None, alias="X-User-Id")):
+    """
+    User -> AI private DM via Supabase REST.
+    Steps:
+      1) threads: get loop_id
+      2) rpc: member_id_for(u, l) -> author_member_id
+      3) messages: insert (role='user', channel='inbox', visibility='private')
+    """
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="X-User-Id header is required")
+
+    # 1) find loop_id for thread
+    th = supa.select_one("threads", {"id": payload.thread_id}, select="loop_id")
+    if not th or not th.get("loop_id"):
+        raise HTTPException(status_code=404, detail="Thread not found")
+    loop_id = th["loop_id"]
+
+    # 2) author membership via RPC (EXPECTED ARG NAMES: u, l)
+    try:
+        author_member_id = supa.rpc("member_id_for", {"u": x_user_id, "l": loop_id})
+        if not author_member_id:
+            raise HTTPException(status_code=403, detail="User is not a member of this loop")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("RPC member_id_for failed (u/l) with x_user_id=%s loop_id=%s : %s", x_user_id, loop_id, e)
+        raise HTTPException(status_code=500, detail="Membership check failed")
+
+    # 3) insert the inbox message (crypto placeholders are NULLs for MVP)
+    content_ciphertext, dek_wrapped, nonce, aead_tag = encrypt_plaintext(payload.content_plain)
+    try:
+        rec = supa.insert("messages", {
+            "thread_id": payload.thread_id,
+            "created_by": x_user_id,
+            "author_member_id": author_member_id,
+            "role": "user",
+            "channel": "inbox",
+            "visibility": "private",
+            "content_ciphertext": content_ciphertext,
+            "dek_wrapped": None,
+            "nonce": None,
+            "aead_tag": None,
+            "lang": "en"
+        })
+        new_id = rec["id"]
+    except Exception as e:
+        logger.error("Insert messages failed: %s", e)
+        raise HTTPException(status_code=500, detail="Insert failed")
+
+    return InboxResponse(
+        message_id=str(new_id),
+        thread_id=payload.thread_id,
+        role="user",
+        channel="inbox",
+        visibility="private",
+        ok=True,
+        note=None,
+    )
+
+
+# --- DEBUG: mirror inbox param resolution and RPC call ---
+
+    # 1) fetch the thread row like the handler does
+    try:
+        tr = supa.select_one("threads", {"id": thread_id}, select="id,loop_id")
+        info["thread_row"] = tr
+        loop_id = tr["loop_id"] if tr else None
+        info["loop_id"] = loop_id
+    except Exception as e:
+        info["thread_error"] = str(e)
+        return info
+
+    # 2) build the exact RPC args
+    rpc_args = {"u": x_user_id, "l": loop_id}
+    info["rpc_args"] = rpc_args
+
+    # 3) call the RPC with those args
+    try:
+        info["rpc_result"] = supa.rpc("member_id_for", rpc_args)
+    except Exception as e:
+        info["rpc_error"] = str(e)
+
+    return info
+
+@app.get("/threads/{thread_id}/messages", response_model=MessagesResponse)
+def list_thread_messages(
+    thread_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    limit: int = 50,
+    order: str = "created_at.asc"
+):
+    """
+    Fetch messages for a thread. Caller must be a member of the loop.
+    limit: default 50
+    order: "created_at.asc" (oldest first) or "created_at.desc" (newest first)
+    """
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="X-User-Id header is required")
+
+    # 1) Find loop_id for this thread
+    th = supa.select_one("threads", {"id": thread_id}, select="id,loop_id")
+    if not th or not th.get("loop_id"):
+        raise HTTPException(status_code=404, detail="Thread not found")
+    loop_id = th["loop_id"]
+
+    # 2) Verify membership
+    try:
+        member_uuid = supa.rpc("member_id_for", {"u": x_user_id, "l": loop_id})
+        if not member_uuid:
+            raise HTTPException(status_code=403, detail="Not a member of this loop")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Membership RPC failed: {}", e)
+        raise HTTPException(status_code=500, detail="Membership check failed")
+
+    # 3) Fetch messages
+    try:
+        rows = supa.select_many(
+            "messages",
+            filters={"thread_id": thread_id},
+            select="id,thread_id,author_member_id,role,channel,visibility,lang,content_ciphertext,created_at",
+            order=order,
+            limit=limit
+        )
+    except Exception as e:
+        logger.error("Select messages failed: {}", e)
+        raise HTTPException(status_code=500, detail="Fetch failed")
+
+    # 4) Build response
+    items = [MessageOut(**r) for r in rows]
+    return MessagesResponse(thread_id=thread_id, count=len(items), items=items)
+
+def _summarize_plain(txt: str) -> str:
+    # MVP summarizer: strip leading 'cipher:' and trim
+    t = txt or ""
+    if t.lower().startswith("cipher:"):
+        t = t[len("cipher:"):].lstrip()
+    # Naive shorten
+    if len(t) > 160:
+        t = t[:157] + "..."
+    return f"cipher: {t}"
+
+
+@app.post("/messages/publish", response_model=PublishResponse, status_code=201)
+def publish_message(payload: PublishRequest, x_user_id: Optional[str] = Header(default=None, alias="X-User-Id")):
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="X-User-Id header is required")
+
+    # 1) Load the inbox message
+    msg = supa.select_one("messages", {"id": payload.inbox_message_id},
+                          select="id,thread_id,author_member_id,role,channel,visibility,content_ciphertext")
+    if not msg:
+        raise HTTPException(status_code=404, detail="Inbox message not found")
+    if msg.get("channel") != "inbox" or msg.get("visibility") != "private":
+        raise HTTPException(status_code=400, detail="Not an inbox/private message")
+
+    thread_id = msg["thread_id"]
+
+    # 2) Find loop_id for this thread
+    th = supa.select_one("threads", {"id": thread_id}, select="id,loop_id")
+    if not th or not th.get("loop_id"):
+        raise HTTPException(status_code=404, detail="Thread not found")
+    loop_id = th["loop_id"]
+
+    # 3) Verify caller is a member of this loop
+    try:
+        caller_member = supa.rpc("member_id_for", {"u": x_user_id, "l": loop_id})
+        if not caller_member:
+            raise HTTPException(status_code=403, detail="Not a member of this loop")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Membership RPC (caller) failed: {}", e)
+        raise HTTPException(status_code=500, detail="Membership check failed")
+
+    # 4) Resolve the loop's bot member (author of the loop message)
+    LOOP_BOT_USER_ID = os.getenv("LOOP_BOT_USER_ID")
+    if not LOOP_BOT_USER_ID:
+        raise HTTPException(status_code=500, detail="Bot user not configured")
+    try:
+        bot_member = supa.rpc("member_id_for", {"u": LOOP_BOT_USER_ID, "l": loop_id})
+        if not bot_member:
+            raise HTTPException(status_code=500, detail="Bot is not a member of this loop")
+    except Exception as e:
+        logger.error("Membership RPC (bot) failed: {}", e)
+        raise HTTPException(status_code=500, detail="Bot membership check failed")
+
+    # 5) Generate summary text (or use override)
+    if payload.summary_override and payload.summary_override.strip():
+        loop_text = "cipher: " + payload.summary_override.strip()
+    else:
+        loop_text = _summarize_plain(msg.get("content_ciphertext") or "")
+
+    # 6) Insert loop-visible AI message
+    try:
+        rec = supa.insert("messages", {
+            "thread_id": thread_id,
+            "created_by": x_user_id,           # initiator who triggered publish
+            "author_member_id": bot_member,    # authored by the loop's agent
+            "role": "ai",
+            "channel": "loop",
+            "visibility": "shared",
+            "content_ciphertext": loop_text,
+            "dek_wrapped": None,
+            "nonce": None,
+            "aead_tag": None,
+            "lang": "en",
+        })
+        new_id = rec["id"]
+    except Exception as e:
+        logger.error("Insert loop message failed: {}", e)
+        raise HTTPException(status_code=500, detail="Insert failed")
+
+    return PublishResponse(published_message_id=str(new_id), thread_id=thread_id, ok=True)

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loop - AI-powered asynchronous communication</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Sidebar Navigation -->
+    <nav class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <h2 class="loop-logo">Loop</h2>
+            <button class="sidebar-toggle" id="sidebarToggle">
+                <span></span>
+                <span></span>
+                <span></span>
+            </button>
+        </div>
+        <ul class="nav-menu">
+            <li><a href="#" class="nav-link active" data-page="home">Home</a></li>
+            <li><a href="#" class="nav-link" data-page="demo">Demo</a></li>
+            <li><a href="#" class="nav-link" data-page="aivl">AIVL Sample</a></li>
+        </ul>
+    </nav>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+        <!-- Homepage -->
+        <section id="home-page" class="page active">
+            <div class="hero-section">
+                <div class="hero-content">
+                    <h1 class="hero-title">Loop</h1>
+                    <p class="hero-subtitle">AI-powered asynchronous communication</p>
+                    <div class="hero-description">
+                        <p>Loop revolutionizes team communication by enabling intelligent, asynchronous conversations mediated by AI. Connect with your team members across time zones while maintaining context and continuity.</p>
+                        <p>Experience seamless collaboration where AI helps bridge communication gaps and ensures everyone stays in sync.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Demo Page -->
+        <section id="demo-page" class="page">
+            <div class="demo-container">
+                <h2 class="page-title">Demo - Three Panel Chat</h2>
+                <div class="demo-grid">
+                    <div class="demo-panel">
+                        <div class="panel-header">
+                            <h3>User A</h3>
+                            <button class="refresh-btn" data-user="user_a">How's my Loop?</button>
+                        </div>
+                        <div class="chat-messages" id="user-a-messages"></div>
+                        <div class="chat-input-container">
+                            <textarea class="chat-input" id="user-a-input" placeholder="Type your message..."></textarea>
+                            <button class="send-btn" data-user="user_a">Send</button>
+                        </div>
+                    </div>
+                    
+                    <div class="demo-panel">
+                        <div class="panel-header">
+                            <h3>User B</h3>
+                            <button class="refresh-btn" data-user="user_b">How's my Loop?</button>
+                        </div>
+                        <div class="chat-messages" id="user-b-messages"></div>
+                        <div class="chat-input-container">
+                            <textarea class="chat-input" id="user-b-input" placeholder="Type your message..."></textarea>
+                            <button class="send-btn" data-user="user_b">Send</button>
+                        </div>
+                    </div>
+                    
+                    <div class="demo-panel">
+                        <div class="panel-header">
+                            <h3>Bot</h3>
+                            <button class="refresh-btn" data-user="bot">How's my Loop?</button>
+                        </div>
+                        <div class="chat-messages" id="bot-messages"></div>
+                        <div class="chat-input-container">
+                            <textarea class="chat-input" id="bot-input" placeholder="Type your message..."></textarea>
+                            <button class="send-btn" data-user="bot">Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- AIVL Sample Page -->
+        <section id="aivl-page" class="page">
+            <!-- User Selection View -->
+            <div id="user-selection" class="aivl-view">
+                <h2 class="page-title">AIVL Sample - Select User</h2>
+                <div class="user-grid">
+                    <div class="user-tile" data-user="Denis">
+                        <h3>Denis</h3>
+                    </div>
+                    <div class="user-tile" data-user="Ravin">
+                        <h3>Ravin</h3>
+                    </div>
+                    <div class="user-tile" data-user="Kanags">
+                        <h3>Kanags</h3>
+                    </div>
+                    <div class="user-tile" data-user="Yanan">
+                        <h3>Yanan</h3>
+                    </div>
+                    <div class="user-tile" data-user="Jason">
+                        <h3>Jason</h3>
+                    </div>
+                    <div class="user-tile" data-user="Arvind">
+                        <h3>Arvind</h3>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Individual User Chat View -->
+            <div id="user-chat" class="aivl-view hidden">
+                <div class="chat-header">
+                    <button class="back-btn">← Back to Users</button>
+                    <div class="user-info">
+                        <h2 id="current-user-name">AIVL Sample</h2>
+                        <p class="thread-members">Thread Members: Denis, Ravin, Kanags, Yanan, Jason, Arvind</p>
+                    </div>
+                </div>
+                
+                <div class="single-chat-container">
+                    <div class="chat-controls">
+                        <button class="refresh-btn main-refresh-btn" id="aivl-refresh">How's my Loop?</button>
+                    </div>
+                    <div class="chat-messages" id="aivl-messages"></div>
+                    <div class="chat-input-container">
+                        <textarea class="chat-input" id="aivl-input" placeholder="Type your message..."></textarea>
+                        <button class="send-btn" id="aivl-send">Send</button>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast hidden">
+        <span id="toast-message"></span>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

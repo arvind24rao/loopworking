@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Loop MVP — Bot-Mediated Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{
+      --bg:#f6f7f9; --card:#fff; --muted:#6b7280; --border:#e5e7eb; --ink:#111827; --ink2:#374151;
+      --accent:#2563eb; --accent2:#eff6ff; --ok:#16a34a; --warn:#d97706;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; padding:16px; background:var(--bg);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      color:var(--ink);
+    }
+    .grid{
+      display:grid; grid-template-columns: repeat(3, 1fr); gap:16px;
+    }
+    .panel{
+      background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px;
+      display:flex; flex-direction:column; min-height:86vh;
+      box-shadow: 0 1px 2px rgba(0,0,0,.05);
+    }
+    h2{margin:0 0 4px 0; font-size:18px}
+    .sub{color:var(--muted); font-size:12px; margin-bottom:8px}
+    textarea{
+      width:100%; min-height:72px; resize:vertical; padding:10px; border-radius:10px;
+      border:1px solid var(--border); outline:none; font:inherit; background:#fafafa;
+    }
+    .row{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0 12px}
+    button{
+      appearance:none; border:1px solid var(--border); background:#fff; padding:8px 12px; border-radius:10px;
+      cursor:pointer; font:inherit;
+    }
+    button.primary{background:var(--accent); border-color:var(--accent); color:white}
+    button.ghost{background:#f9fafb}
+    button:disabled{opacity:.6; cursor:not-allowed}
+    .sectionTitle{font-size:13px; color:var(--ink2); margin:4px 0 8px}
+    .list{
+      border:1px solid var(--border); border-radius:10px; background:#fafafa; padding:8px; overflow:auto;
+      flex:1; min-height:240px;
+    }
+    .item{
+      background:#fff; border:1px solid var(--border); border-radius:10px; padding:10px; margin:6px 0;
+    }
+    .meta{display:flex; gap:8px; align-items:center; font-size:11px; color:var(--muted); margin-top:6px}
+    .pill{border:1px solid var(--border); background:var(--accent2); color:var(--accent); padding:2px 6px; border-radius:999px; font-size:11px}
+    .small{font-size:11px; color:var(--muted)}
+    .toolbar{display:flex; gap:8px; align-items:center}
+    .status{position:fixed; right:16px; bottom:16px; background:#111827; color:#fff; padding:10px 12px; border-radius:10px; font-size:12px; opacity:0; transform:translateY(8px); transition:all .2s ease}
+    .status.show{opacity:1; transform:translateY(0)}
+    @media (max-width:1100px){ .grid{grid-template-columns:1fr} .panel{min-height:auto} }
+  </style>
+</head>
+<body>
+
+  <div class="grid">
+
+    <!-- USER A -->
+    <section class="panel" id="pane-a">
+      <h2>User A</h2>
+      <div class="sub">Sends to Bot · sees only Bot → A</div>
+
+      <textarea id="a-msg" placeholder="Message to Bot…"></textarea>
+      <div class="row">
+        <button class="primary" id="a-send">Send</button>
+        <button class="ghost" id="a-refresh">Refresh Inbox</button>
+      </div>
+
+      <div class="sectionTitle">Bot → A Inbox</div>
+      <div class="list" id="a-inbox"></div>
+    </section>
+
+    <!-- USER B -->
+    <section class="panel" id="pane-b">
+      <h2>User B</h2>
+      <div class="sub">Sends to Bot · sees only Bot → B</div>
+
+      <textarea id="b-msg" placeholder="Message to Bot…"></textarea>
+      <div class="row">
+        <button class="primary" id="b-send">Send</button>
+        <button class="ghost" id="b-refresh">Refresh Inbox</button>
+      </div>
+
+      <div class="sectionTitle">Bot → B Inbox</div>
+      <div class="list" id="b-inbox"></div>
+    </section>
+
+    <!-- BOT -->
+    <section class="panel" id="pane-bot">
+      <h2>Bot</h2>
+      <div class="sub">Sees human queue · can reply or auto-reply (LLM)</div>
+
+      <div class="toolbar row">
+        <button class="ghost" id="bot-refresh">Refresh Queue</button>
+        <button class="ghost" id="bot-clear">Clear Thread (dev)</button>
+        <button class="primary" id="bot-auto">Auto-Reply (process)</button>
+      </div>
+
+      <div class="sectionTitle">Human → Bot Queue</div>
+      <div class="list" id="bot-queue"></div>
+
+      <div class="sectionTitle">Manual reply</div>
+      <div class="row">
+        <label class="small" for="bot-recipient">Recipient:</label>
+        <select id="bot-recipient">
+          <option value="a">User A</option>
+          <option value="b">User B</option>
+        </select>
+      </div>
+      <textarea id="bot-msg" placeholder="Reply text…"></textarea>
+      <div class="row">
+        <button class="primary" id="bot-send">Send Reply</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="status" id="status">Ready</div>
+
+<script>
+/* ---------- Config (edit IDs if needed) ---------- */
+const API    = window.location.origin; // served by FastAPI
+const THREAD = "b01164e6-c719-4fb1-b2d0-85755e7ebf38";
+const USER_A = "b8d99c3c-0d3a-4773-a324-a6bc60dee64e";
+const USER_B = "0dd8b495-6a25-440d-a6e4-d8b7a77bc688";
+const BOT    = "b59042b5-9cee-4c20-ad5d-8a0ad42cb374";
+
+/* ---------- Helpers ---------- */
+function toast(msg, kind="info"){
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.style.background = kind==="ok" ? "#065f46" : (kind==="warn" ? "#92400e" : "#111827");
+  el.classList.add("show");
+  clearTimeout(el._t); el._t = setTimeout(()=>el.classList.remove("show"), 1800);
+}
+
+async function req(path, opts = {}){
+  const r = await fetch(`${API}${path}`, {cache:"no-store", ...opts});
+  const text = await r.text();
+  let json = null; try{ json = text ? JSON.parse(text) : null; }catch{}
+  if(!r.ok){ throw new Error((json && (json.detail || json.message)) || text || `HTTP ${r.status}`); }
+  return json ?? {};
+}
+
+function stripCipher(s){
+  if(typeof s !== "string") return "";
+  return s.startsWith("cipher:") ? s.slice(7).trim() : s;
+}
+
+function fmtTime(iso){
+  try {
+    const d = new Date(iso);
+    return d.toLocaleString();
+  } catch { return iso || ""; }
+}
+
+function renderItems(containerId, items, {kind}){
+  const el = document.getElementById(containerId);
+  el.innerHTML = "";
+  if(!items || items.length===0){
+    el.innerHTML = `<div class="small" style="padding:6px 2px;color:var(--muted)">[empty]</div>`;
+    return;
+  }
+  for(const it of items){
+    const text = stripCipher(it.content_plain);
+    const meta = fmtTime(it.created_at || "");
+    const pill = (kind==="queue") ? "inbox_to_bot" : "bot_to_user";
+    const who  = it.created_by ? it.created_by.slice(0,8) : "";
+    el.insertAdjacentHTML("beforeend", `
+      <div class="item">
+        <div>${text ? escapeHtml(text) : "<span class='small' style='color:var(--muted)'>[no content]</span>"}</div>
+        <div class="meta">
+          <span class="pill">${pill}</span>
+          ${who ? `<span>from <code>${who}</code></span>` : ""}
+          <span>${meta}</span>
+        </div>
+      </div>
+    `);
+  }
+}
+function escapeHtml(s){ return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m])); }
+
+/* ---------- API wrappers ---------- */
+async function sendToBot(userId, text){
+  await req("/messages/inbox", {
+    method:"POST",
+    headers: {"Content-Type":"application/json","X-User-Id": userId},
+    body: JSON.stringify({ thread_id: THREAD, content_plain: text })
+  });
+}
+
+async function fetchInbox(userId){
+  const data = await req(`/me/inbox?limit=100`, { headers: {"X-User-Id": userId} });
+  return data.items || [];
+}
+
+async function fetchQueue(){
+  const data = await req(`/bot/inbox?thread_id=${THREAD}&limit=100`, { headers: {"X-User-Id": BOT} });
+  return data.items || [];
+}
+
+async function sendBotReply(recipientId, text){
+  await req("/bot/reply", {
+    method:"POST",
+    headers: {"Content-Type":"application/json","X-User-Id": BOT},
+    body: JSON.stringify({ recipient_profile_id: recipientId, thread_id: THREAD, content_plain: text })
+  });
+}
+
+async function autoProcess(){
+  return await req(`/bot/process?thread_id=${THREAD}&limit=25&dry_run=false`, {
+    method:"POST",
+    headers: {"X-User-Id": BOT}
+  });
+}
+
+async function clearThread(){
+  await req(`/__debug/clear?thread_id=${THREAD}`, {
+    method:"DELETE",
+    headers: {"X-User-Id": BOT}
+  });
+}
+
+/* ---------- UI actions ---------- */
+async function onSendA(){
+  const ta = document.getElementById("a-msg");
+  const msg = ta.value.trim(); if(!msg) return;
+  ta.value = "";
+  await sendToBot(USER_A, msg);
+  toast("Sent from A → Bot", "ok");
+  await refreshAll({who:"queue"});
+}
+async function onSendB(){
+  const ta = document.getElementById("b-msg");
+  const msg = ta.value.trim(); if(!msg) return;
+  ta.value = "";
+  await sendToBot(USER_B, msg);
+  toast("Sent from B → Bot", "ok");
+  await refreshAll({who:"queue"});
+}
+async function onManualBot(){
+  const sel = document.getElementById("bot-recipient").value;
+  const ta = document.getElementById("bot-msg");
+  const msg = ta.value.trim(); if(!msg) return;
+  ta.value = "";
+  const target = sel === "a" ? USER_A : USER_B;
+  await sendBotReply(target, msg);
+  toast("Bot replied", "ok");
+  await refreshAll({who:"both"});
+}
+async function onAuto(){
+  const res = await autoProcess();
+  toast(`Processed: ${res.processed}/${res.count}`, res.processed ? "ok" : "warn");
+  await refreshAll({who:"both"});
+}
+async function onClear(){
+  await clearThread();
+  toast("Thread cleared", "ok");
+  await refreshAll({who:"both"});
+}
+
+async function refreshA(){
+  const items = await fetchInbox(USER_A);
+  renderItems("a-inbox", items, {kind:"dm"});
+}
+async function refreshB(){
+  const items = await fetchInbox(USER_B);
+  renderItems("b-inbox", items, {kind:"dm"});
+}
+async function refreshQueue(){
+  const items = await fetchQueue();
+  renderItems("bot-queue", items, {kind:"queue"});
+}
+async function refreshAll({who="both"}={}){
+  const jobs = [];
+  if(who==="both" || who==="a") jobs.push(refreshA());
+  if(who==="both" || who==="b") jobs.push(refreshB());
+  if(who==="both" || who==="queue") jobs.push(refreshQueue());
+  await Promise.allSettled(jobs);
+}
+
+/* ---------- Wire up & bootstrap ---------- */
+document.getElementById("a-send").onclick = onSendA;
+document.getElementById("b-send").onclick = onSendB;
+document.getElementById("a-refresh").onclick = () => refreshA().catch(()=>{});
+document.getElementById("b-refresh").onclick = () => refreshB().catch(()=>{});
+document.getElementById("bot-refresh").onclick = () => refreshQueue().catch(()=>{});
+document.getElementById("bot-send").onclick = onManualBot;
+document.getElementById("bot-auto").onclick = onAuto;
+document.getElementById("bot-clear").onclick = onClear;
+
+// initial load
+refreshAll({who:"both"}).catch(()=>{});
+
+// light polling (2s) for a smoother demo
+setInterval(()=> refreshAll({who:"both"}).catch(()=>{}), 2000);
+</script>
+</body>
+</html>

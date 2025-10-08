@@ -1,0 +1,174 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Loop Demo (MVP)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+      .card { border: 1px solid #e5e7eb; padding: 1rem; border-radius: 12px; margin-bottom: 1rem; }
+      .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+      textarea { width: 100%; height: 100px; }
+      button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid #d1d5db; background: #f9fafb; cursor: pointer; }
+      button:disabled { opacity: .6; cursor: not-allowed; }
+      code { background: #f3f4f6; padding: 0 .25rem; border-radius: 6px; }
+      .item { padding: .5rem .75rem; border: 1px solid #e5e7eb; border-radius: 8px; margin: .5rem 0; }
+      small { color: #6b7280; }
+      #debug { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; background:#f8fafc; border:1px dashed #e5e7eb; padding:.75rem; border-radius:8px; }
+    </style>
+  </head>
+  <body>
+    <h1>Loop — Web Demo (MVP)</h1>
+    <div class="card">
+      <div class="row">
+        <label>User:</label>
+        <select id="user">
+          <option value="b8d99c3c-0d3a-4773-a324-a6bc60dee64e">User A</option>
+          <option value="0dd8b495-6a25-440d-a6e4-d8b7a77bc688">User B</option>
+        </select>
+        <label>Thread:</label>
+        <select id="thread">
+          <option value="b01164e6-c719-4fb1-b2d0-85755e7ebf38">Seed Thread</option>
+        </select>
+        <span id="health" style="margin-left:auto;">health: <em>unknown</em></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Compose to Inbox → Publish</h3>
+      <textarea id="text" placeholder="Type a message…"></textarea>
+      <div class="row">
+        <button id="send">Send & Publish</button>
+        <span id="status"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Feed (published)</h3>
+      <div id="feed"></div>
+      <div class="row"><button id="refresh">Refresh</button></div>
+    </div>
+
+    <div class="card">
+      <h3>Debug</h3>
+      <div id="debug">Ready</div>
+    </div>
+
+    <script>
+      // Use explicit same-origin base; avoids Safari "Load failed" edge cases.
+      const API = window.location.origin;
+      const el = (id) => document.getElementById(id);
+
+      function log(msg, obj) {
+        const pre = el("debug");
+        const line = typeof obj === "undefined" ? msg : msg + " " + JSON.stringify(obj, null, 2);
+        pre.textContent = line;
+        console.log(msg, obj ?? "");
+      }
+
+      async function req(path, options = {}) {
+        const url = `${API}${path}`;
+        const opts = { cache: "no-store", ...options };
+        const r = await fetch(url, opts);
+        const txt = await r.text(); // get raw for better errors
+        let json = null;
+        try { json = txt ? JSON.parse(txt) : null; } catch {}
+        if (!r.ok) {
+          const detail = (json && (json.detail || json.message)) || txt || `HTTP ${r.status}`;
+          throw new Error(`${r.status} ${detail}`.trim());
+        }
+        return json ?? {};
+      }
+
+      async function ping() {
+        try {
+          const res = await req("/health");
+          el("health").innerHTML = `health: <code>200</code>`;
+          log("health OK", res);
+        } catch (e) {
+          el("health").textContent = "health: error";
+          log("health error:", e.message || e);
+        }
+      }
+
+      async function inbox(user, thread_id, content_plain) {
+        return req("/messages/inbox", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-User-Id": user },
+          body: JSON.stringify({ thread_id, content_plain }),
+        });
+      }
+
+      async function publish(user, body) {
+        return req("/messages/publish", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-User-Id": user },
+          body: JSON.stringify(body),
+        });
+      }
+
+      async function loadFeed(user, thread_id) {
+        const data = await req(`/threads/${thread_id}/feed?limit=20`, {
+          headers: { "X-User-Id": user },
+        });
+        const feed = el("feed");
+        feed.innerHTML = "";
+        (data.items || []).forEach(it => {
+          const d = document.createElement("div");
+          d.className = "item";
+          d.innerHTML = `<div>${it.content_plain}</div><small>${it.published_at}</small>`;
+          feed.appendChild(d);
+        });
+        if (!data.items || data.items.length === 0) {
+          feed.innerHTML = "<em>No published messages yet.</em>";
+        }
+        log("feed OK", data);
+      }
+
+      async function send() {
+        const thread_id = el("thread").value;
+        const user = el("user").value;
+        const content_plain = el("text").value.trim();
+        if (!content_plain) return;
+        el("send").disabled = true;
+        el("status").textContent = "sending…";
+        try {
+          const inboxRes = await inbox(user, thread_id, content_plain);
+          el("status").textContent = "inbox ✓";
+          await publish(user, { message_id: inboxRes.message_id });
+          el("status").textContent = "published ✓";
+          el("text").value = "";
+          await loadFeed(user, thread_id);
+        } catch (e) {
+          el("status").textContent = e.message || "error";
+          log("send/publish/feed error:", e.message || e);
+        } finally {
+          el("send").disabled = false;
+        }
+      }
+
+      el("send").addEventListener("click", send);
+      el("refresh").addEventListener("click", async () => {
+        const thread_id = el("thread").value;
+        const user = el("user").value;
+        try {
+          await loadFeed(user, thread_id);
+        } catch (e) {
+          log("refresh error:", e.message || e);
+        }
+      });
+
+      // Boot
+      ping();
+      (async () => {
+        try {
+          const thread_id = el("thread").value;
+          const user = el("user").value;
+          await loadFeed(user, thread_id);
+        } catch (e) {
+          log("initial feed error:", e.message || e);
+        }
+      })();
+    </script>
+  </body>
+</html>

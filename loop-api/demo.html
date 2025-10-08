@@ -1,0 +1,98 @@
+<!-- /Users/arvindrao/loop/loop-api/app/static/demo.html -->
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Loop Demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+      .card { border: 1px solid #e5e7eb; padding: 1rem; border-radius: 12px; margin-bottom: 1rem; }
+      .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+      textarea { width: 100%; height: 100px; }
+      button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid #d1d5db; background: #f9fafb; cursor: pointer; }
+      button:disabled { opacity: .6; cursor: not-allowed; }
+      code { background: #f3f4f6; padding: 0 .25rem; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>Loop — Web Demo (MVP)</h1>
+    <div class="card">
+      <div class="row">
+        <label>User:</label>
+        <select id="user">
+          <option value="b8d99c3c-0d3a-4773-a324-a6bc60dee64e">User A</option>
+          <option value="0dd8b495-6a25-440d-a6e4-d8b7a77bc688">User B</option>
+        </select>
+        <label>Thread:</label>
+        <select id="thread">
+          <option value="b01164e6-c719-4fb1-b2d0-85755e7ebf38">Seed Thread</option>
+        </select>
+        <span id="health" style="margin-left:auto;">health: <em>unknown</em></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Compose to Inbox</h3>
+      <textarea id="text" placeholder="Type a message…"></textarea>
+      <div class="row">
+        <button id="send">Send</button>
+        <span id="status"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Feed (published)</h3>
+      <div id="feed"></div>
+      <div class="row"><button id="refresh">Refresh</button></div>
+    </div>
+
+    <script>
+      const api = "";
+      const el = (id) => document.getElementById(id);
+
+      async function ping() {
+        try {
+          const r = await fetch(`${api}/health`);
+          el("health").innerHTML = `health: <code>${r.status}</code>`;
+        } catch {
+          el("health").textContent = "health: error";
+        }
+      }
+
+      async function send() {
+        const thread_id = el("thread").value;
+        const user = el("user").value;
+        const content_plain = el("text").value.trim();
+        if (!content_plain) return;
+
+        el("send").disabled = true;
+        el("status").textContent = "sending…";
+
+        try {
+          const r = await fetch(`${api}/messages/inbox`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-User-Id": user },
+            body: JSON.stringify({ thread_id, content_plain }),
+          });
+          const j = await r.json();
+          el("status").textContent = r.ok ? "sent (inbox)" : `error: ${j.detail || r.status}`;
+        } catch (e) {
+          el("status").textContent = "error";
+        } finally {
+          el("send").disabled = false;
+        }
+      }
+
+      async function refresh() {
+        // This will work after we add the feed endpoint in the next step.
+        el("feed").innerHTML = "<em>Feed wiring comes in Step 2.</em>";
+      }
+
+      el("send").addEventListener("click", send);
+      el("refresh").addEventListener("click", refresh);
+
+      ping();
+    </script>
+  </body>
+</html>

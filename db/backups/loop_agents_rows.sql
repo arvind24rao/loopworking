@@ -1,0 +1,1 @@
+INSERT INTO "public"."loop_agents" ("id", "loop_id", "agent_profile_id", "created_at") VALUES ('6c92e2c1-05fa-4e34-b721-6878e6e81d28', 'e94bd651-5bac-4e39-8537-fe8c788c1475', 'b59042b5-9cee-4c20-ad5d-8a0ad42cb374', '2025-09-12 11:27:08.594357+00');

@@ -1,0 +1,1 @@
+INSERT INTO "public"."loops" ("id", "created_by", "name", "primary_timezone", "phrasing_style", "is_active", "created_at") VALUES ('e94bd651-5bac-4e39-8537-fe8c788c1475', 'b8d99c3c-0d3a-4773-a324-a6bc60dee64e', 'AB Test Loop', 'Asia/Singapore', 'direct', 'true', '2025-09-12 11:27:08.594357+00');
