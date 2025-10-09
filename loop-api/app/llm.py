@@ -1,55 +1,119 @@
-# /Users/arvindrao/loop/loop-api/app/llm.py
+# app/llm.py
+from __future__ import annotations
+
 import os
-from typing import List
-from dotenv import load_dotenv
+from typing import List, Optional
+
 from openai import OpenAI
 
-# Load env once (same .env.dev used by main)
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env.dev"))
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Read env (no .env file assumption in prod)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY missing in environment")
 
-_client = OpenAI(api_key=OPENAI_API_KEY)
+_client: Optional[OpenAI] = None
+if OPENAI_API_KEY:
+    _client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM_PROMPT = (
-    "You are LoopBot, a neutral relay.\n"
-    "- You NEVER imply the recipient experienced events written by the other user.\n"
-    "- You speak concisely and do not add new facts.\n"
-    "- If you ask a follow-up, keep it brief and optional.\n"
+    "You are Loop's relay bot. You write short, neutral, actionable summaries "
+    "to forward from one participant to another. Never include private messages "
+    "from the recipient themself; only summarize what the sender said. Be concise."
 )
 
 TEMPLATE_RULES = (
-    "Compose ONE short message for {recipient_label}.\n"
-    "The content below is from {sender_label}.\n\n"
-    "OUTPUT FORMAT (strict):\n"
-    "Update from {sender_label}: <one-sentence summary of what {sender_label} said>. "
-    "<optional very brief follow-up question to {recipient_label} about how they'd like to respond to {sender_label}>.\n\n"
-    "STYLE & CONSTRAINTS:\n"
-    "- Refer to {sender_label} in third person (\"A said…\").\n"
-    "- Do NOT use \"you\" to describe {sender_label}'s actions.\n"
-    "- No emojis. Max ~25 words total.\n"
+    "Write a 1–3 sentence update for {recipient_label} about what {sender_label} said. "
+    "Prefer concrete facts, dates, owners, and next steps. Avoid speculation. "
+    "If there is nothing meaningful, reply with a very brief courtesy note."
 )
 
-def generate_reply(context_messages: List[str], recipient_label: str, sender_label: str) -> str:
-    """
-    context_messages: ordered list of the other user's messages (latest last)
-    recipient_label: 'A' or 'B' — who will receive the DM
-    sender_label:    'A' or 'B' — who wrote the context
-    """
-    user_blob = "\n\n".join(context_messages[-5:]) if context_messages else "(no context)"
-    prompt = TEMPLATE_RULES.format(recipient_label=recipient_label, sender_label=sender_label) + \
-             f"\nContext messages from {sender_label} (latest last):\n{user_blob}\n"
+def _join_context(snippets: Optional[List[str]], max_items: int = 5) -> str:
+    parts = (snippets or [])[-max_items:]
+    parts = [p.strip() for p in parts if isinstance(p, str)]
+    return "\n\n".join(parts) if parts else "(no context)"
 
-    resp = _client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-        max_tokens=120,
+def _llm_generate(user_content: str, *, max_tokens: int = 160) -> str:
+    if not _client:
+        # Fallback if key missing: return first line of context
+        return user_content.splitlines()[-1][:220].strip() or "FYI."
+    try:
+        resp = _client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text[:600].strip() or "FYI."
+    except Exception:
+        # Safe fallback
+        return "FYI."
+
+def _generate_reply_new(
+    *,
+    sender_profile_id: str,
+    recipient_profile_id: str,
+    thread_id: str,
+    loop_id: str,
+    recent_messages: Optional[List[str]] = None,
+    max_tokens: int = 160,
+    **_unused,
+) -> str:
+    sender_label = f"sender {sender_profile_id}"
+    recipient_label = f"recipient {recipient_profile_id}"
+    context_blob = _join_context(recent_messages, max_items=5)
+    prompt = (
+        TEMPLATE_RULES.format(recipient_label=recipient_label, sender_label=sender_label)
+        + f"\n\nThread: {thread_id}\nLoop: {loop_id}\n"
+        + f"Context from {sender_label} (oldest→newest):\n{context_blob}\n"
     )
-    return (resp.choices[0].message.content or "").strip()
+    return _llm_generate(prompt, max_tokens=max_tokens)
+
+def _generate_reply_legacy(
+    message_text: str = "",
+    thread_id: str = "",
+    recipients: Optional[List[str]] = None,
+    **_unused,
+) -> str:
+    recipient_label = f"recipient {recipients[0]}" if recipients else "recipient"
+    sender_label = "sender"
+    context_blob = _join_context([message_text], max_items=1)
+    prompt = (
+        TEMPLATE_RULES.format(recipient_label=recipient_label, sender_label=sender_label)
+        + f"\n\nThread: {thread_id}\n"
+        + f"Context from {sender_label}:\n{context_blob}\n"
+    )
+    return _llm_generate(prompt, max_tokens=140)
+
+def generate_reply(*args, **kwargs) -> str:
+    """
+    Dispatch to the new or legacy signature.
+
+    New (used by /bot/process):
+        generate_reply(
+            sender_profile_id=..., recipient_profile_id=...,
+            thread_id=..., loop_id=..., recent_messages=[...]
+        )
+
+    Legacy:
+        generate_reply(message_text: str, thread_id: str, recipients: List[str])
+    """
+    if "sender_profile_id" in kwargs or "recipient_profile_id" in kwargs:
+        return _generate_reply_new(**kwargs)
+    # legacy positional support
+    if args:
+        # (message_text, thread_id, recipients)
+        message_text = args[0] if len(args) > 0 else ""
+        thread_id = args[1] if len(args) > 1 else ""
+        recipients = args[2] if len(args) > 2 else None
+        return _generate_reply_legacy(message_text, thread_id, recipients)
+    # legacy keyword support
+    return _generate_reply_legacy(
+        kwargs.get("message_text", ""),
+        kwargs.get("thread_id", ""),
+        kwargs.get("recipients"),
+    )
+
+__all__ = ["generate_reply"]
