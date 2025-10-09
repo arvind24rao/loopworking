@@ -3,15 +3,13 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Header, HTTPException, Query
+from pydantic import BaseModel
 
 from app.db import get_conn  # psycopg connection factory
 from app.llm import generate_reply  # existing LLM relay helper
-from app.models import BotProcessResult  # if you don't have this, we define a local schema below
 from app.crypto import seal_plaintext  # shim that returns "cipher:<text>" as per handbook
 
 router = APIRouter(prefix="/bot", tags=["bot"])
@@ -116,11 +114,7 @@ def _thread_loop_id_and_members(conn, thread_id: str) -> Tuple[str, List[str]]:
     """
     with conn.cursor() as cur:
         cur.execute(
-            """
-            select t.loop_id
-            from threads t
-            where t.id = %s
-            """,
+            "select t.loop_id from threads t where t.id = %s",
             (uuid.UUID(thread_id),),
         )
         res = cur.fetchone()
@@ -129,11 +123,7 @@ def _thread_loop_id_and_members(conn, thread_id: str) -> Tuple[str, List[str]]:
         (loop_id,) = res
 
         cur.execute(
-            """
-            select lm.profile_id
-            from loop_members lm
-            where lm.loop_id = %s
-            """,
+            "select lm.profile_id from loop_members lm where lm.loop_id = %s",
             (loop_id,),
         )
         member_rows = cur.fetchall()
@@ -144,7 +134,6 @@ def _thread_loop_id_and_members(conn, thread_id: str) -> Tuple[str, List[str]]:
 def _resolve_bot_member_id(conn, *, loop_id: str, bot_profile_id: str) -> Optional[str]:
     """
     Finds the loop_agents entry for (loop_id, bot_profile_id) and returns its member id (the agent 'member' row).
-    Fallback: None (we'll insert created_by as the bot and leave author_member_id null if needed).
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -177,7 +166,6 @@ def _select_recent_sender_messages(conn, *, thread_id: str, author_member_id: st
             (uuid.UUID(thread_id), uuid.UUID(author_member_id), limit),
         )
         rows = cur.fetchall()
-    # reverse to oldest -> newest and strip the 'cipher:' shim
     out = []
     for (cipher_text,) in rows[::-1]:
         text = cipher_text or ""
@@ -296,7 +284,6 @@ def process_queue(
                 new_ids: List[str] = []
                 for recipient_profile_id in recipients:
                     if dry_run:
-                        # No insert; still count as processed preview
                         continue
                     relay_text = generate_reply(
                         sender_profile_id=author_profile_id,
@@ -307,7 +294,6 @@ def process_queue(
                     ).strip()
 
                     if not relay_text:
-                        # Avoid inserting empties; skip just this recipient
                         continue
 
                     new_id = _insert_bot_dm(
@@ -332,7 +318,6 @@ def process_queue(
                 conn.commit()
                 items.append(item)
             except HTTPException:
-                # let FastAPI handle, but ensure we don't hold an open transaction
                 conn.rollback()
                 raise
             except Exception as e:
