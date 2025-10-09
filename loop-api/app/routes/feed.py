@@ -14,6 +14,29 @@ from pydantic import BaseModel
 UTC = timezone.utc
 router = APIRouter(prefix="/api", tags=["feed"])
 
+# openai test
+@router.get("/feed/selftest")
+def feed_selftest():
+    try:
+        from openai import OpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return {"ok": False, "reason": "missing OPENAI_API_KEY"}
+        client = OpenAI(api_key=api_key)
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        r = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Reply with a single short sentence."},
+                {"role": "user", "content": "Say hello from Loop API."}
+            ],
+            max_tokens=20,
+            temperature=0
+        )
+        return {"ok": True, "engine": "openai", "sample": r.choices[0].message.content.strip()}
+    except Exception as e:
+        return {"ok": False, "reason": "openai_exception", "detail": str(e)[:300]}
+
 # ----------------------------
 # Supabase helpers
 # ----------------------------
