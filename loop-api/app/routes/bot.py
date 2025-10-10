@@ -12,7 +12,8 @@ from app.db import get_conn  # psycopg connection factory
 from app.llm import generate_reply  # existing LLM relay helper
 from app.crypto import seal_plaintext  # shim that returns "cipher:<text>" as per handbook
 
-router = APIRouter(prefix="/bot", tags=["bot"])
+# router = APIRouter(prefix="/bot", tags=["bot"])
+router = APIRouter(prefix="/api/bot", tags=["bot"])
 
 # ---- Config helpers ---------------------------------------------------------
 
