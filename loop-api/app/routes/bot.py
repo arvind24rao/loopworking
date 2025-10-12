@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 # --- Adjust these imports to match your project structure ---
 from app.db import get_conn                  # psycopg connection (context manager)
-from app.llm import generate_reply           # LLM helper you already use
+from app.llm import generate_reply           # your LLM helper (now using max_completion_tokens internally)
 from app.crypto import seal_plaintext        # encrypts message.content before insert
 # ------------------------------------------------------------
 
@@ -17,6 +17,37 @@ router = APIRouter(prefix="/api/bot", tags=["bot"])
 
 INBOX_TO_BOT = "inbox_to_bot"
 BOT_TO_USER = "bot_to_user"
+
+
+# ========================= Models ========================= #
+
+class ProcessStats(BaseModel):
+    scanned: int = 0
+    processed: int = 0
+    inserted: int = 0
+    skipped: int = 0
+    dry_run: bool = False
+
+
+class PreviewItem(BaseModel):
+    recipient_profile_id: str
+    content: str
+
+
+class ProcessItemResult(BaseModel):
+    human_message_id: str
+    thread_id: str
+    recipients: List[str] = []
+    bot_rows: List[str] = []
+    previews: List[PreviewItem] = []
+    skipped_reason: Optional[str] = None
+
+
+class BotProcessResponse(BaseModel):
+    ok: bool = True
+    reason: Optional[str] = None
+    stats: ProcessStats
+    items: List[ProcessItemResult] = []
 
 
 # ========================= Helpers ========================= #
@@ -116,37 +147,6 @@ def _mark_human_processed(conn, human_id: str) -> None:
         )
 
 
-# ========================= Models ========================= #
-
-class ProcessStats(BaseModel):
-    scanned: int = 0
-    processed: int = 0
-    inserted: int = 0
-    skipped: int = 0
-    dry_run: bool = False
-
-
-class PreviewItem(BaseModel):
-    recipient_profile_id: str
-    content: str
-
-
-class ProcessItemResult(BaseModel):
-    human_message_id: str
-    thread_id: str
-    recipients: List[str] = []
-    bot_rows: List[str] = []
-    previews: List[PreviewItem] = []
-    skipped_reason: Optional[str] = None
-
-
-class BotProcessResponse(BaseModel):
-    ok: bool = True
-    reason: Optional[str] = None
-    stats: ProcessStats
-    items: List[ProcessItemResult] = []
-
-
 # ========================= Route ========================= #
 
 @router.post("/process", response_model=BotProcessResponse)
@@ -161,7 +161,7 @@ def process_queue(
 
     Behaviour:
     - With dry_run=True: DO NOT insert; return `previews` per recipient for the UI.
-    - With dry_run=False: insert `bot_to_user` rows and mark the human message as processed.
+    - With dry_run=False: insert `bot_to_user` rows and mark each human message as processed.
     """
     bot_profile_id = _require_bot_caller(x_user_id)
     stats = ProcessStats(dry_run=dry_run)
@@ -185,41 +185,52 @@ def process_queue(
                 recipients = [pid for pid in member_ids if pid != author_profile_id]
                 item.recipients = recipients
 
+                # Nothing to do if no recipients (e.g., single-member loop)
+                if not recipients:
+                    item.skipped_reason = "no_recipients"
+                    stats.skipped += 1
+                    items.append(item)
+                    continue
+
                 # --- build candidate bot messages (LLM) per recipient ---
+                # If your generate_reply returns per-recipient differences, call it inside the loop.
+                # If it's the same text for all, you can compute once and reuse.
                 candidate_msgs: List[Dict[str, str]] = []
                 for rid in recipients:
                     try:
                         reply_text = generate_reply(
-                            text=str(h["content"] or ""),
+                            text=str(h.get("content") or ""),
                             sender_profile_id=author_profile_id,
                             recipient_profile_id=rid,
                             thread_id=str(h["thread_id"]),
                             loop_id=loop_id,
                         )
+                        reply_text = str(reply_text)
+                        if not reply_text.strip():
+                            raise ValueError("empty reply from LLM")
                     except Exception as e:
-                        # If LLM fails for this human message, mark skipped and continue to next human message
+                        # Record failure for this human msg and skip publishing; do NOT 500 the whole request
                         item.skipped_reason = f"llm_error: {e}"
                         stats.skipped += 1
-                        # Do not mark processed; just append and move on
                         items.append(item)
-                        raise  # bubble to outer except to skip publish/commit for this human
-
+                        # Do not mark processed; proceed to next human message
+                        raise  # bubble to outer except so we rollback and continue outer loop
                     candidate_msgs.append(
-                        {
-                            "recipient_profile_id": rid,
-                            "content": reply_text,
-                        }
+                        {"recipient_profile_id": rid, "content": reply_text}
                     )
 
                 if dry_run:
                     # --- DRY RUN: return previews (NO INSERTS, NO MARK) ---
                     item.previews = [
-                        PreviewItem(recipient_profile_id=m["recipient_profile_id"], content=m["content"])
+                        PreviewItem(
+                            recipient_profile_id=m["recipient_profile_id"],
+                            content=m["content"]
+                        )
                         for m in candidate_msgs
                     ]
                     stats.processed += 1
                     items.append(item)
-                    # Continue to next human without committing
+                    # continue without commit (we didn't write)
                     continue
 
                 # --- PUBLISH: insert rows & mark processed ---
@@ -227,7 +238,7 @@ def process_queue(
                 for m in candidate_msgs:
                     new_id = _insert_bot_to_user(
                         conn,
-                        thread_id=str(h["thread_id"]),      # ✅ correct indexing
+                        thread_id=str(h["thread_id"]),   # ✅ correct; do NOT write str(h)["thread_id"]
                         bot_profile_id=bot_profile_id,
                         recipient_id=m["recipient_profile_id"],
                         content=m["content"],
@@ -244,18 +255,16 @@ def process_queue(
                 items.append(item)
 
             except HTTPException:
-                # Respect explicit HTTP errors
                 conn.rollback()
                 raise
 
             except Exception:
                 # Any other failure for this human message -> rollback this iteration only, keep overall request 200
                 conn.rollback()
-                # If we didn't set skipped_reason above, set a generic one
+                # If we didn't set a more specific reason above, set a generic one
                 if not item.skipped_reason:
                     item.skipped_reason = "error: failed to process message"
-                stats.skipped += 1
                 items.append(item)
-                # proceed with next human
+                # proceed with next human (do not re-raise)
 
     return BotProcessResponse(ok=True, stats=stats, items=items)
