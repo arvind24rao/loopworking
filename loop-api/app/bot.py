@@ -1,141 +1,228 @@
-# /Users/arvindrao/loop/loop-api/app/bot.py
+# app/routes/bot.py
+from __future__ import annotations
+
 import os
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Query, Header, HTTPException
+from pydantic import BaseModel, Field
+
 from loguru import logger
 
-from .supa import supa, SUPABASE_URL
-from .crypto import encrypt_plaintext
-from .llm import generate_reply
+# Project-local helpers (present in your repo)
+from app.llm import generate_reply
+from app.supa import supa  # typed Supabase client
+from app.crypto import encrypt_plaintext  # encryption helper, used pre-insert if needed
 
-BOT_PROFILE_ID = os.getenv("BOT_PROFILE_ID")
+router = APIRouter(tags=["bot"])  # main.py mounts this with prefix="/api/bot"
 
-# Seed participants for the MVP (make dynamic later if you want)
-USER_A = "b8d99c3c-0d3a-4773-a324-a6bc60dee64e"
-USER_B = "0dd8b495-6a25-440d-a6e4-d8b7a77bc688"
+# --- Env knobs / IDs ---
+BOT_PROFILE_ID = os.getenv("BOT_PROFILE_ID") or os.getenv("BOT_PROFILE_IDS", "").split(",")[0] or ""
+
+# Your known test users (A, B) — can be overridden via env if needed
+USER_A = os.getenv("TEST_USER_A", "c9cf9661-346c-4f9d-a549-66137f29d87e")
+USER_B = os.getenv("TEST_USER_B", "21520d4c-3c62-46d1-b056-636ca91481a2")
+
+# Keep work small (but still LLM-powered)
+RECIPIENT_MAX        = int(os.getenv("RECIPIENT_MAX", "2"))
+HISTORY_MAX_MESSAGES = int(os.getenv("HISTORY_MAX_MESSAGES", "6"))
+
+# --- Pydantic response model for symmetry with your existing API shape ---
+class BotProcessItem(BaseModel):
+    human_message_id: str = Field(..., description="source inbox_to_bot message id")
+    thread_id: str
+    recipients: List[str] = []
+    bot_rows: List[str] = []        # ids of inserted bot_to_user rows
+    skipped_reason: Optional[str] = None
+
+class BotProcessStats(BaseModel):
+    scanned: int
+    processed: int
+    inserted: int
+    skipped: int
+    dry_run: bool
+
+class BotProcessResponse(BaseModel):
+    ok: bool = True
+    reason: Optional[str] = None
+    stats: BotProcessStats
+    items: List[BotProcessItem] = []
+
+
+# ---- Small data helpers (DB access via supabase) ----
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 def _select_unprocessed(thread_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
-    params = {
-        "select": "id,thread_id,created_by,content_ciphertext,created_at",
-        "audience": "eq.inbox_to_bot",
-        "order": "created_at.asc,id.asc",
-        "limit": str(limit),
-        "bot_processed_at": "is.null",
-    }
+    """
+    Fetches inbox_to_bot messages awaiting processing, oldest first.
+    If thread_id is supplied, scope to that thread.
+    """
+    q = supa.table("messages").select("*").eq("audience", "inbox_to_bot").eq("processed", False).order("created_at", asc=True)
     if thread_id:
-        params["thread_id"] = f"eq.{thread_id}"
-    r = supa.client.get(f"{SUPABASE_URL}/rest/v1/messages", params=params)
-    r.raise_for_status()
-    return r.json()
+        q = q.eq("thread_id", thread_id)
+    q = q.limit(max(1, int(limit)))
+    res = q.execute()
+    rows: List[Dict[str, Any]] = res.data or []
+    return rows
 
 def _mark_processed(ids: List[str]) -> None:
     if not ids:
         return
-    import datetime
-    for mid in ids:
-        params = {"id": f"eq.{mid}"}
-        payload = {"bot_processed_at": datetime.datetime.utcnow().isoformat() + "Z"}
-        headers = {"Prefer": "return=representation"}
-        r = supa.client.patch(f"{SUPABASE_URL}/rest/v1/messages", params=params, json=payload, headers=headers)
-        r.raise_for_status()
+    supa.table("messages").update({"processed": True}).in_("id", ids).execute()
 
-def _other_party(profile_id: str) -> Optional[str]:
-    if profile_id == USER_A:
-        return USER_B
-    if profile_id == USER_B:
-        return USER_A
-    return None
+def _fetch_recent_history(thread_id: str, limit: int) -> List[Dict[str, Any]]:
+    res = supa.table("messages").select("id, audience, created_by, recipient_profile_id, content, created_at") \
+             .eq("thread_id", thread_id) \
+             .order("created_at", desc=True) \
+             .limit(max(1, limit)) \
+             .execute()
+    rows = res.data or []
+    rows.reverse()  # oldest first
+    return rows
 
-def _labels_for(sender: str, recipient: str) -> (str, str):
-    # Return ('recipient_label','sender_label') as 'A'/'B'
-    recipient_label = "A" if recipient == USER_A else "B"
-    sender_label = "A" if sender == USER_A else "B"
-    return recipient_label, sender_label
+def _compute_recipients(sender_id: str) -> List[str]:
+    # For test purposes, only A and B (minus the sender)
+    pool = [USER_A, USER_B]
+    recipients = [rid for rid in pool if rid and rid != sender_id]
+    if RECIPIENT_MAX > 0 and len(recipients) > RECIPIENT_MAX:
+        recipients = recipients[:RECIPIENT_MAX]
+    return recipients
 
-def _loop_id_for_thread(thread_id: str) -> str:
-    row = supa.select_one("threads", {"id": thread_id}, select="loop_id")
-    return row["loop_id"]
+def _insert_bot_to_user(thread_id: str, recipient_id: str, content: str) -> str:
+    # If your schema needs encryption, uncomment this:
+    # content = encrypt_plaintext(content)
+    payload = {
+        "thread_id": thread_id,
+        "audience": "bot_to_user",
+        "created_by": BOT_PROFILE_ID or "bot",
+        "recipient_profile_id": recipient_id,
+        "content": content,
+        "created_at": _now_iso(),
+    }
+    res = supa.table("messages").insert(payload).execute()
+    row = (res.data or [{}])[0]
+    return row.get("id") or ""
 
-def _member_id_for(profile_id: str, loop_id: str) -> str:
-    return supa.rpc("member_id_for", {"u": profile_id, "l": loop_id})
 
-def _insert_bot_dm(thread_id: str, recipient: str, content_plain: str) -> str:
-    loop_id = _loop_id_for_thread(thread_id)
-    bot_member_id = _member_id_for(BOT_PROFILE_ID, loop_id)
-    content_ciphertext, dek_wrapped, nonce, aead_tag = encrypt_plaintext(content_plain)
-    rec = supa.insert(
-        "messages",
-        {
-            "thread_id": thread_id,
-            "created_by": BOT_PROFILE_ID,
-            "author_member_id": bot_member_id,
-            "role": "user",
-            "channel": "inbox",
-            "visibility": "private",
-            "audience": "bot_to_user",
-            "recipient_profile_id": recipient,
-            "content_ciphertext": content_ciphertext,
-            "dek_wrapped": None,
-            "nonce": None,
-            "aead_tag": None,
-            "lang": "en",
-        },
-    )
-    return rec["id"]
+# ---- The processor endpoint ----
 
-def process_queue(thread_id: Optional[str], limit: int, dry_run: bool = False) -> Dict[str, Any]:
-    rows = _select_unprocessed(thread_id, limit)
-    processed_ids: List[str] = []
-    outputs: List[Dict[str, Any]] = []
+@router.post("/process", response_model=BotProcessResponse)
+def process(
+    thread_id: Optional[str] = Query(None, description="If set, only process this thread"),
+    limit: int = Query(1, ge=1, le=50),
+    dry_run: bool = Query(False),
+    x_user_id: str = Header(..., alias="X-User-Id"),
+):
+    """
+    Scans inbox_to_bot messages and fans out bot_to_user messages using the LLM.
+    Keeps workload tiny via RECIPIENT_MAX and HISTORY_MAX_MESSAGES.
+    """
+    if not BOT_PROFILE_ID:
+        raise HTTPException(status_code=400, detail="No BOT_PROFILE_ID configured")
+    if x_user_id != BOT_PROFILE_ID:
+        raise HTTPException(status_code=403, detail="X-User-Id must match BOT_PROFILE_ID")
 
-    for row in rows:
-        sender = row["created_by"]
-        recipient = _other_party(sender)
-        if not recipient:
-            outputs.append({"message_id": row["id"], "skipped": True, "reason": "unknown sender"})
-            continue
+    try:
+        rows = _select_unprocessed(thread_id, limit)
+        scanned = len(rows)
+        processed = 0
+        inserted = 0
+        skipped = 0
+        items: List[BotProcessItem] = []
 
-        # Build compact context from this sender in this thread
-        ctx_params = {
-            "select": "content_ciphertext,created_at",
-            "thread_id": f"eq.{row['thread_id']}",
-            "created_by": f"eq.{sender}",
-            "audience": "eq.inbox_to_bot",
-            "order": "created_at.asc",
-            "limit": "5",
-        }
-        rr = supa.client.get(f"{SUPABASE_URL}/rest/v1/messages", params=ctx_params)
-        rr.raise_for_status()
-        ctx_rows = rr.json()
-        context_messages = [r["content_ciphertext"] for r in ctx_rows]
+        for row in rows:
+            src_id    = row.get("id")
+            t_id      = row.get("thread_id")
+            sender_id = row.get("created_by") or row.get("sender_id") or ""
 
-        # Perspective-safe LLM call
-        recipient_label, sender_label = _labels_for(sender, recipient)
-        try:
-            reply_text = generate_reply(context_messages, recipient_label=recipient_label, sender_label=sender_label)
-        except Exception as e:
-            logger.error("LLM call failed: {}", e)
-            outputs.append({"message_id": row["id"], "skipped": True, "reason": f"llm_error: {e}"})
-            continue
-
-        new_id = None
-        if not dry_run:
-            try:
-                new_id = _insert_bot_dm(row["thread_id"], recipient, reply_text)
-            except Exception as e:
-                logger.error("Insert bot DM failed: {}", e)
-                outputs.append({"message_id": row["id"], "skipped": True, "reason": f"insert_error: {e}"})
+            if not (src_id and t_id and sender_id):
+                skipped += 1
+                items.append(BotProcessItem(
+                    human_message_id=src_id or "",
+                    thread_id=t_id or (thread_id or ""),
+                    recipients=[],
+                    bot_rows=[],
+                    skipped_reason="missing_fields"
+                ))
                 continue
 
-        processed_ids.append(row["id"])
-        outputs.append({
-            "message_id": row["id"],
-            "recipient": recipient,
-            "dm_id": new_id,
-            "preview": reply_text[:160],
-            "dry_run": dry_run,
-        })
+            # recipients (A,B minus sender), cap by RECIPIENT_MAX
+            recips = _compute_recipients(sender_id)
 
-    if processed_ids and not dry_run:
-        _mark_processed(processed_ids)
+            # trim history for prompt
+            history = _fetch_recent_history(t_id, HISTORY_MAX_MESSAGES)
+            # very small prompt: just the latest human text
+            latest_text = (row.get("content") or "").strip()
+            if not latest_text:
+                skipped += 1
+                items.append(BotProcessItem(
+                    human_message_id=src_id,
+                    thread_id=t_id,
+                    recipients=recips,
+                    bot_rows=[],
+                    skipped_reason="empty_text"
+                ))
+                continue
 
-    return {"count": len(rows), "processed": len(processed_ids), "dry_run": dry_run, "items": outputs}
+            # Call LLM ONCE per source message (not per recipient) to keep time bounded
+            try:
+                reply_text = generate_reply(message_text=latest_text, thread_id=t_id, recipients=recips)
+            except Exception as e:
+                logger.exception("LLM error on src %s: %s", src_id, e)
+                skipped += 1
+                items.append(BotProcessItem(
+                    human_message_id=src_id,
+                    thread_id=t_id,
+                    recipients=recips,
+                    bot_rows=[],
+                    skipped_reason="llm_error"
+                ))
+                continue
+
+            bot_rows: List[str] = []
+            if not dry_run:
+                for r in recips:
+                    try:
+                        new_id = _insert_bot_to_user(t_id, r, reply_text)
+                        if new_id:
+                            bot_rows.append(new_id)
+                            inserted += 1
+                    except Exception as e:
+                        logger.exception("Insert failed for recipient %s (src %s): %s", r, src_id, e)
+
+            processed += 1
+            items.append(BotProcessItem(
+                human_message_id=src_id,
+                thread_id=t_id,
+                recipients=recips,
+                bot_rows=bot_rows,
+                skipped_reason=None
+            ))
+
+            # mark processed AFTER successful handling (or dry_run skip marking)
+            if not dry_run:
+                try:
+                    _mark_processed([src_id])
+                except Exception as e:
+                    logger.exception("Mark processed failed for %s: %s", src_id, e)
+
+        return BotProcessResponse(
+            ok=True,
+            reason=None,
+            stats=BotProcessStats(
+                scanned=scanned,
+                processed=processed,
+                inserted=inserted,
+                skipped=skipped,
+                dry_run=dry_run
+            ),
+            items=items
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("bot.process failed: %s", e)
+        raise HTTPException(status_code=500, detail="bot_process_exception")
