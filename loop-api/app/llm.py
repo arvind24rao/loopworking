@@ -10,7 +10,7 @@ from openai import OpenAI
 # --- Env knobs (works with both OPENAI_MODEL and LLM_MODEL) ---
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL        = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-LLM_MAX_TOKENS   = int(os.getenv("LLM_MAX_TOKENS", "256"))
+LLM_MAX_COMPLETION_TOKENS   = int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "256"))
 LLM_TIMEOUT_SEC  = int(os.getenv("LLM_TIMEOUT_SEC", "45"))
 LLM_RETRIES      = int(os.getenv("LLM_RETRIES", "1"))
 LLM_RETRY_MAX_S  = int(os.getenv("LLM_RETRY_MAX_SEC", "10"))
