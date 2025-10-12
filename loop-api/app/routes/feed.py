@@ -30,7 +30,7 @@ def feed_selftest():
                 {"role": "system", "content": "Reply with a single short sentence."},
                 {"role": "user", "content": "Say hello from Loop API."}
             ],
-            max_tokens=20,
+            max_completion_tokens=20,
             temperature=0
         )
         return {"ok": True, "engine": "openai", "sample": r.choices[0].message.content.strip()}
@@ -149,7 +149,7 @@ def summarise_messages(loop_name: str, requester_handle: str, messages: List[str
                 {"role": "user", "content": user},
             ],
             temperature=0.2,
-            max_tokens=220,
+            max_completion_tokens=220,
         )
         text = resp.choices[0].message.content.strip()
         return (text, "openai")

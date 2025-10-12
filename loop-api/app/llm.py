@@ -23,7 +23,7 @@ if OPENAI_API_KEY:
 
 def _chat_with_retry(messages: List[Dict[str, Any]],
                      model: Optional[str] = None,
-                     max_tokens: Optional[int] = None) -> str:
+                     max_completion_tokens: Optional[int] = None) -> str:
     """
     Small, bounded retry wrapper around Chat Completions.
     Returns the final text or raises an exception after retries.
@@ -33,7 +33,7 @@ def _chat_with_retry(messages: List[Dict[str, Any]],
         raise RuntimeError("OPENAI_API_KEY not configured")
 
     model = model or LLM_MODEL
-    max_tokens = max_tokens or LLM_MAX_COMPLETION_TOKENS
+    max_completion_tokens = max_completion_tokens or LLM_MAX_COMPLETION_TOKENS
 
     delay = 1.0
     for attempt in range(LLM_RETRIES + 1):
@@ -41,7 +41,7 @@ def _chat_with_retry(messages: List[Dict[str, Any]],
             resp = _client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=max_tokens,
+                max_completion_tokens=max_completion_tokens,
                 # If your client supports per-call timeout param, you may pass it here.
             )
             text = (resp.choices[0].message.content or "").strip()
@@ -69,7 +69,7 @@ def generate_reply(*args, **kwargs) -> str:
         {"role": "system", "content": "You are a concise assistant helping two users coordinate. Keep replies brief and useful."},
         {"role": "user", "content": message_text or "Respond helpfully."}
     ]
-    return _chat_with_retry(messages, model=LLM_MODEL, max_tokens=LLM_MAX_COMPLETION_TOKENS)
+    return _chat_with_retry(messages, model=LLM_MODEL, max_completion_tokens=LLM_MAX_COMPLETION_TOKENS)
 
 
 __all__ = ["generate_reply"]
