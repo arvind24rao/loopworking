@@ -33,7 +33,7 @@ def _chat_with_retry(messages: List[Dict[str, Any]],
         raise RuntimeError("OPENAI_API_KEY not configured")
 
     model = model or LLM_MODEL
-    max_tokens = max_tokens or LLM_MAX_TOKENS
+    max_tokens = max_tokens or LLM_MAX_COMPLETION_TOKENS
 
     delay = 1.0
     for attempt in range(LLM_RETRIES + 1):
@@ -69,7 +69,7 @@ def generate_reply(*args, **kwargs) -> str:
         {"role": "system", "content": "You are a concise assistant helping two users coordinate. Keep replies brief and useful."},
         {"role": "user", "content": message_text or "Respond helpfully."}
     ]
-    return _chat_with_retry(messages, model=LLM_MODEL, max_tokens=LLM_MAX_TOKENS)
+    return _chat_with_retry(messages, model=LLM_MODEL, max_tokens=LLM_MAX_COMPLETION_TOKENS)
 
 
 __all__ = ["generate_reply"]
