@@ -13,7 +13,7 @@ try:
 except Exception:
     feed_router = None
 from app.routes.diag import router as diag_router
-
+from app.diagnostics import router as diagnostics_router
 
 def _cors_origins() -> list[str]:
     # Allow local dev + Netlify preview + prod by default; override via CORS_ORIGINS
@@ -51,6 +51,7 @@ def create_app() -> FastAPI:
     # Include routers WITHOUT extra prefixes. Each router carries its own.
     app.include_router(messages_router)  # /api/...
     app.include_router(bot_router)       # /bot/...
+    app.include_router(diagnostics_router)
     app.include_router(diag_router)  # /health/db
     if feed_router is not None:
         app.include_router(feed_router)  # /api/feed...
