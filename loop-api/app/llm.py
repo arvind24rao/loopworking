@@ -46,7 +46,7 @@ def _chat_with_retry(messages: List[Dict[str, Any]],
             )
             text = (resp.choices[0].message.content or "").strip()
             # keep messages short to avoid downstream bloat
-            return (text[:600].strip() or "FYI.")
+            return (text[:600].strip() or "fyi taken from llm.py")
         except Exception as e:
             if attempt >= LLM_RETRIES:
                 # Final fail
