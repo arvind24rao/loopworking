@@ -2,20 +2,22 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel
 from loguru import logger
 
-# Project-local helpers (expected in repo)
+import os
+import psycopg  # psycopg 3.x
+from psycopg.rows import dict_row
+
+# Project-local helpers
 from app.llm import generate_reply
-from app.supa import supa  # Supabase Python client (postgrest)
 
 router = APIRouter(prefix="/api", tags=["bot"])
 
-
-# --------- Models (response wiring) ---------
+# ---------- Models ----------
 
 class BotProcessItemPreview(BaseModel):
     recipient_profile_id: str
@@ -33,7 +35,7 @@ class BotProcessStats(BaseModel):
     inserted: int = 0
     skipped: int = 0
     dry_run: bool = True
-    recipient_ids: List[str] = []  # optional for quick console visibility
+    recipient_ids: List[str] = []  # flattened unique ids for quick console checks
 
 
 class BotProcessResponse(BaseModel):
@@ -43,91 +45,144 @@ class BotProcessResponse(BaseModel):
     items: List[BotProcessItem] = []
 
 
-# --------- Small utils ---------
+# ---------- Utility ----------
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _select_unprocessed(thread_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
+def _get_conn() -> psycopg.Connection:
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL (or SUPABASE_DB_URL) is not set")
+    return psycopg.connect(dsn, row_factory=dict_row)
+
+
+# ---------- Core SQL helpers (RLS-safe with service creds) ----------
+
+def _select_unprocessed(conn: psycopg.Connection, thread_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
     """
-    Fetch inbox_to_bot messages awaiting processing for a given thread.
-    Enforces processed=false semantics (COALESCE handled via default/trigger in DB).
-    Returns a list of raw dict rows (PostgREST style).
+    Select unprocessed inbox_to_bot messages.
+    Using COALESCE(processed,false)=false to be robust.
     """
-    query = (
-        supa.table("messages")
-        .select(
-            "id, thread_id, created_at, created_by, author_member_id, audience, content, processed, processed_at"
-        )
-        .eq("audience", "inbox_to_bot")
-        .eq("processed", False)
-        .order("created_at", desc=False)
-        .limit(limit)
-    )
     if thread_id:
-        query = query.eq("thread_id", thread_id)
-    res = query.execute()
-    data = getattr(res, "data", None) or res.get("data", [])
-    return data or []
+        q = """
+            SELECT id, thread_id, created_at, created_by, author_member_id, audience, content
+            FROM messages
+            WHERE thread_id = %s
+              AND audience = 'inbox_to_bot'
+              AND COALESCE(processed, FALSE) = FALSE
+            ORDER BY created_at ASC
+            LIMIT %s
+        """
+        args: Tuple[Any, ...] = (thread_id, limit)
+    else:
+        q = """
+            SELECT id, thread_id, created_at, created_by, author_member_id, audience, content
+            FROM messages
+            WHERE audience = 'inbox_to_bot'
+              AND COALESCE(processed, FALSE) = FALSE
+            ORDER BY created_at ASC
+            LIMIT %s
+        """
+        args = (limit,)
+
+    with conn.cursor() as cur:
+        cur.execute(q, args)
+        return list(cur.fetchall())
 
 
-def _mark_processed(message_ids: List[str]) -> None:
-    if not message_ids:
-        return
-    supa.table("messages").update(
-        {"processed": True, "processed_at": _now_iso()}
-    ).in_("id", message_ids).execute()
+def _loop_id_for_member(conn: psycopg.Connection, author_member_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT loop_id FROM members WHERE id = %s",
+            (author_member_id,),
+        )
+        row = cur.fetchone()
+        return row["loop_id"] if row else None
 
 
-def _insert_bot_messages(rows: List[Dict[str, Any]]) -> int:
-    """
-    Insert bot_to_user messages; returns number inserted.
-    rows must contain: thread_id, created_at, created_by (bot), audience='bot_to_user',
-                       recipient_profile_id, content
-    """
-    if not rows:
-        return 0
-    res = supa.table("messages").insert(rows).execute()
-    data = getattr(res, "data", None) or res.get("data", [])
-    return len(data or rows)
+def _recipients_for_loop(conn: psycopg.Connection, loop_id: str, exclude_ids: List[str]) -> List[str]:
+    placeholders = ", ".join(["%s"] * len(exclude_ids)) if exclude_ids else ""
+    if exclude_ids:
+        q = f"""
+            SELECT profile_id
+            FROM members
+            WHERE loop_id = %s
+              AND profile_id NOT IN ({placeholders})
+        """
+        args: Tuple[Any, ...] = (loop_id, *exclude_ids)
+    else:
+        q = """
+            SELECT profile_id
+            FROM members
+            WHERE loop_id = %s
+        """
+        args = (loop_id,)
+
+    with conn.cursor() as cur:
+        cur.execute(q, args)
+        return [r["profile_id"] for r in cur.fetchall()]
 
 
-def _resolve_recipients_via_supabase(
-    author_member_id: str,
-    author_profile_id: str,
+def _insert_bot_messages_and_mark_processed(
+    conn: psycopg.Connection,
+    *,
     bot_profile_id: str,
-) -> List[str]:
+    to_publish: List[Dict[str, Any]],
+    source_message_ids: List[str],
+) -> Tuple[int, int]:
     """
-    Canonical recipient logic using Supabase:
-      loop_id := members(loop_id) via author_member_id
-      recipients := all members.profile_id in loop_id MINUS {author_profile_id, bot_profile_id}
+    Insert rows into messages (audience='bot_to_user') and mark sources processed.
+    Returns (inserted_count, processed_count).
     """
-    # 1) loop_id from members
-    mem = (
-        supa.table("members")
-        .select("loop_id")
-        .eq("id", author_member_id)
-        .single()
-        .execute()
-    )
-    loop_id = (getattr(mem, "data", None) or mem.get("data", {})).get("loop_id")
-    if not loop_id:
-        return []
+    inserted = 0
+    processed = 0
 
-    # 2) recipients from members in loop
-    data = (
-        supa.table("members")
-        .select("profile_id")
-        .eq("loop_id", loop_id)
-        .execute()
-    )
-    profs = [d["profile_id"] for d in ((getattr(data, "data", None) or data.get("data", [])) or [])]
-    exclude = {author_profile_id, bot_profile_id}
-    return [pid for pid in profs if pid not in exclude]
+    with conn.cursor() as cur:
+        # Insert bot_to_user rows
+        if to_publish:
+            # Build a VALUES list
+            values_sql = ", ".join(
+                ["(%s, %s, %s, %s, %s, %s)"] * len(to_publish)
+            )
+            args: List[Any] = []
+            for row in to_publish:
+                args.extend([
+                    row["thread_id"],
+                    row["created_at"],
+                    bot_profile_id,
+                    "bot_to_user",
+                    row["recipient_profile_id"],
+                    row["content"],
+                ])
+
+            cur.execute(
+                f"""
+                INSERT INTO messages (thread_id, created_at, created_by, audience, recipient_profile_id, content)
+                VALUES {values_sql}
+                """,
+                args,
+            )
+            inserted = cur.rowcount  # number of rows inserted
+
+        # Mark sources processed
+        if source_message_ids:
+            placeholders = ", ".join(["%s"] * len(source_message_ids))
+            cur.execute(
+                f"""
+                UPDATE messages
+                SET processed = TRUE, processed_at = NOW()
+                WHERE id IN ({placeholders})
+                """,
+                source_message_ids,
+            )
+            processed = cur.rowcount
+
+    return inserted, processed
 
 
-# --------- Route implementation ---------
+# ---------- Route ----------
 
 @router.post("/bot/process", response_model=BotProcessResponse)
 def process_bot_messages(
@@ -137,9 +192,10 @@ def process_bot_messages(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     """
-    Processes human inbox_to_bot messages and either previews (dry_run) or publishes
-    bot_to_user replies. Uses members(loop_id) derived from author_member_id to determine
-    recipients, excluding the author and bot(s).
+    Process human inbox_to_bot messages into bot_to_user messages.
+    Recipient resolution is done via members(loop_id) derived from author_member_id,
+    excluding {author_profile_id, bot_profile_id}.
+    All publish operations happen in a single DB transaction.
     """
     if not x_user_id:
         raise HTTPException(status_code=400, detail="missing_bot_profile_id_header")
@@ -149,85 +205,85 @@ def process_bot_messages(
     inserted = 0
     skipped = 0
     items: List[BotProcessItem] = []
-    all_recipient_ids: List[str] = []
+    flat_recipients: List[str] = []
 
     try:
-        # 1) select eligible work
-        rows = _select_unprocessed(thread_id, limit=limit)
-        scanned = len(rows)
+        with _get_conn() as conn:
+            rows = _select_unprocessed(conn, thread_id=thread_id, limit=limit)
+            scanned = len(rows)
 
-        if not rows:
-            return BotProcessResponse(
-                stats=BotProcessStats(
-                    scanned=scanned,
-                    processed=processed,
-                    inserted=inserted,
-                    skipped=skipped,
-                    dry_run=dry_run,
-                    recipient_ids=[],
-                ),
-                items=[],
-            )
-
-        # 2) for each message, resolve recipients and generate previews
-        to_insert: List[Dict[str, Any]] = []
-        processed_ids: List[str] = []
-
-        for r in rows:
-            msg_id = r["id"]
-            author_profile_id = r["created_by"]
-            author_member_id = r.get("author_member_id")
-            content = r.get("content") or ""
-            thread = r["thread_id"]
-
-            if not author_member_id:
-                logger.warning("message %s missing author_member_id; skipping", msg_id)
-                skipped += 1
-                continue
-
-            # resolve recipients canonically
-            recipients = _resolve_recipients_via_supabase(
-                author_member_id=author_member_id,
-                author_profile_id=author_profile_id,
-                bot_profile_id=x_user_id,
-            )
-            all_recipient_ids.extend(recipients)
-
-            # build previews
-            previews = []
-            for pid in recipients:
-                reply_text = generate_reply(
-                    human_text=content,
-                    author_profile_id=author_profile_id,
-                    recipient_profile_id=pid,
-                    thread_id=thread,
+            if not rows:
+                return BotProcessResponse(
+                    stats=BotProcessStats(
+                        scanned=scanned,
+                        processed=processed,
+                        inserted=inserted,
+                        skipped=skipped,
+                        dry_run=dry_run,
+                        recipient_ids=[],
+                    ),
+                    items=[],
                 )
-                previews.append(BotProcessItemPreview(recipient_profile_id=pid, text=reply_text))
 
-                if not dry_run:
-                    to_insert.append(
-                        {
-                            "thread_id": thread,
-                            "created_at": _now_iso(),
-                            "created_by": x_user_id,
-                            "audience": "bot_to_user",
-                            "recipient_profile_id": pid,
-                            "content": reply_text,
-                        }
+            to_publish: List[Dict[str, Any]] = []
+            source_ids: List[str] = []
+
+            for r in rows:
+                msg_id = r["id"]
+                author_profile_id = r["created_by"]
+                author_member_id = r.get("author_member_id")
+                content = r.get("content") or ""
+                thread = r["thread_id"]
+
+                if not author_member_id:
+                    logger.warning("message %s missing author_member_id; skipping", msg_id)
+                    skipped += 1
+                    continue
+
+                loop_id = _loop_id_for_member(conn, author_member_id)
+                if not loop_id:
+                    logger.warning("message %s could not resolve loop_id; skipping", msg_id)
+                    skipped += 1
+                    continue
+
+                exclude = [author_profile_id, x_user_id]
+                recipients = _recipients_for_loop(conn, loop_id, exclude_ids=exclude)
+                flat_recipients.extend(recipients)
+
+                previews: List[BotProcessItemPreview] = []
+                for pid in recipients:
+                    reply_text = generate_reply(
+                        human_text=content,
+                        author_profile_id=author_profile_id,
+                        recipient_profile_id=pid,
+                        thread_id=thread,
                     )
+                    previews.append(BotProcessItemPreview(recipient_profile_id=pid, text=reply_text))
 
-            items.append(BotProcessItem(human_message_id=msg_id, previews=previews))
+                    if not dry_run:
+                        to_publish.append(
+                            {
+                                "thread_id": thread,
+                                "created_at": _now_iso(),
+                                "recipient_profile_id": pid,
+                                "content": reply_text,
+                            }
+                        )
+
+                items.append(BotProcessItem(human_message_id=msg_id, previews=previews))
+                if not dry_run:
+                    source_ids.append(msg_id)
 
             if not dry_run:
-                processed_ids.append(msg_id)
-
-        # 3) publish (insert + mark processed) or just return previews
-        if not dry_run:
-            if to_insert:
-                inserted = _insert_bot_messages(to_insert)
-            if processed_ids:
-                _mark_processed(processed_ids)
-                processed = len(processed_ids)
+                with conn.transaction():
+                    ins, proc = _insert_bot_messages_and_mark_processed(
+                        conn,
+                        bot_profile_id=x_user_id,
+                        to_publish=to_publish,
+                        source_message_ids=source_ids,
+                    )
+                    inserted += ins
+                    processed += proc
 
         return BotProcessResponse(
             stats=BotProcessStats(
@@ -236,7 +292,7 @@ def process_bot_messages(
                 inserted=inserted,
                 skipped=skipped,
                 dry_run=dry_run,
-                recipient_ids=list(dict.fromkeys(all_recipient_ids)),
+                recipient_ids=list(dict.fromkeys(flat_recipients)),
             ),
             items=items,
         )
