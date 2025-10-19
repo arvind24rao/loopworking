@@ -12,11 +12,10 @@ import os
 import psycopg  # psycopg 3.x
 from psycopg.rows import dict_row
 
-# Project-local LLM helper
+# Project-local helpers
 from app.llm import generate_reply
 
 router = APIRouter(prefix="/api", tags=["bot"])
-
 
 # ---------- Models ----------
 
@@ -36,12 +35,7 @@ class BotProcessStats(BaseModel):
     inserted: int = 0
     skipped: int = 0
     dry_run: bool = True
-    recipient_ids: List[str] = []  # flattened unique ids
-    # debug fields (only when debug=true)
-    db_user: Optional[str] = None
-    session_user: Optional[str] = None
-    loop_id: Optional[str] = None
-    bot_member_id: Optional[str] = None
+    recipient_ids: List[str] = []  # flattened unique ids for quick console checks
 
 
 class BotProcessResponse(BaseModel):
@@ -64,22 +58,16 @@ def _get_conn() -> psycopg.Connection:
     return psycopg.connect(dsn, row_factory=dict_row)
 
 
-def _as_bool(v) -> bool:
-    if isinstance(v, bool): return v
-    if v is None: return True
-    return str(v).lower() in ("1", "true", "t", "yes", "y")
-
-
-# ---------- Core SQL helpers ----------
+# ---------- Core SQL helpers (RLS-safe with service creds) ----------
 
 def _select_unprocessed(conn: psycopg.Connection, thread_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
     """
-    Select unprocessed human messages (inbox_to_bot) for this thread.
+    Select unprocessed inbox_to_bot messages.
+    Using COALESCE(processed,false)=false to be robust.
     """
     if thread_id:
         q = """
-            SELECT id, thread_id, created_at, created_by, author_member_id,
-                   audience
+            SELECT id, thread_id, created_at, created_by, author_member_id, audience, content
             FROM messages
             WHERE thread_id = %s
               AND audience = 'inbox_to_bot'
@@ -90,8 +78,7 @@ def _select_unprocessed(conn: psycopg.Connection, thread_id: Optional[str], limi
         args: Tuple[Any, ...] = (thread_id, limit)
     else:
         q = """
-            SELECT id, thread_id, created_at, created_by, author_member_id,
-                   audience
+            SELECT id, thread_id, created_at, created_by, author_member_id, audience, content
             FROM messages
             WHERE audience = 'inbox_to_bot'
               AND COALESCE(processed, FALSE) = FALSE
@@ -107,19 +94,12 @@ def _select_unprocessed(conn: psycopg.Connection, thread_id: Optional[str], limi
 
 def _loop_id_for_member(conn: psycopg.Connection, author_member_id: str) -> Optional[str]:
     with conn.cursor() as cur:
-        cur.execute("SELECT loop_id FROM members WHERE id = %s", (author_member_id,))
-        row = cur.fetchone()
-        return row["loop_id"] if row else None
-
-
-def _bot_member_id_for_loop(conn: psycopg.Connection, loop_id: str, bot_profile_id: str) -> Optional[str]:
-    with conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM members WHERE loop_id = %s AND profile_id = %s",
-            (loop_id, bot_profile_id),
+            "SELECT loop_id FROM members WHERE id = %s",
+            (author_member_id,),
         )
         row = cur.fetchone()
-        return row["id"] if row else None
+        return row["loop_id"] if row else None
 
 
 def _recipients_for_loop(conn: psycopg.Connection, loop_id: str, exclude_ids: List[str]) -> List[str]:
@@ -133,7 +113,11 @@ def _recipients_for_loop(conn: psycopg.Connection, loop_id: str, exclude_ids: Li
         """
         args: Tuple[Any, ...] = (loop_id, *exclude_ids)
     else:
-        q = "SELECT profile_id FROM members WHERE loop_id = %s"
+        q = """
+            SELECT profile_id
+            FROM members
+            WHERE loop_id = %s
+        """
         args = (loop_id,)
 
     with conn.cursor() as cur:
@@ -145,48 +129,44 @@ def _insert_bot_messages_and_mark_processed(
     conn: psycopg.Connection,
     *,
     bot_profile_id: str,
-    bot_member_id: str,
     to_publish: List[Dict[str, Any]],
     source_message_ids: List[str],
 ) -> Tuple[int, int]:
     """
-    Insert rows into messages (audience='bot_to_user') with required columns
-    and mark sources processed. Returns (inserted_count, processed_count).
+    Insert rows into messages (audience='bot_to_user') and mark sources processed.
+    Returns (inserted_count, processed_count).
     """
     inserted = 0
     processed = 0
 
     with conn.cursor() as cur:
+        # Insert bot_to_user rows
         if to_publish:
-            values_sql = ", ".join(["(%s,%s,%s,%s,%s,%s,%s,%s,%s)"] * len(to_publish))
+            # Build a VALUES list
+            values_sql = ", ".join(
+                ["(%s, %s, %s, %s, %s, %s)"] * len(to_publish)
+            )
             args: List[Any] = []
             for row in to_publish:
-                # required: thread_id, created_at, created_by, author_member_id, role, channel,
-                #          visibility, audience, recipient_profile_id, content_ciphertext
                 args.extend([
                     row["thread_id"],
                     row["created_at"],
-                    bot_profile_id,            # created_by
-                    bot_member_id,             # author_member_id (bot's member in this loop)
-                    "bot",                     # role
-                    "outbox",                  # channel
-                    "private",                 # visibility
-                    "bot_to_user",             # audience
+                    bot_profile_id,
+                    "bot_to_user",
                     row["recipient_profile_id"],
-                    row["content_ciphertext"], # NOTE: plaintext for now (no encryptor wired)
+                    row["content"],
                 ])
 
             cur.execute(
                 f"""
-                INSERT INTO messages
-                  (thread_id, created_at, created_by, author_member_id,
-                   role, channel, visibility, audience, recipient_profile_id, content_ciphertext)
+                INSERT INTO messages (thread_id, created_at, created_by, audience, recipient_profile_id, content)
                 VALUES {values_sql}
                 """,
                 args,
             )
-            inserted = cur.rowcount
+            inserted = cur.rowcount  # number of rows inserted
 
+        # Mark sources processed
         if source_message_ids:
             placeholders = ", ".join(["%s"] * len(source_message_ids))
             cur.execute(
@@ -209,49 +189,38 @@ def process_bot_messages(
     thread_id: Optional[str] = Query(default=None, description="Thread (conversation) id"),
     limit: int = Query(default=10, ge=1, le=100),
     dry_run: bool = Query(default=True),
-    debug: Optional[bool] = Query(default=False),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     """
     Process human inbox_to_bot messages into bot_to_user messages.
-
-    Key differences vs before:
-      - Derive loop_id from author_member_id (members.loop_id)
-      - Resolve bot_member_id in that loop (required NOT NULL)
-      - Insert with required NOT NULL columns (incl. content_ciphertext)
-      - Mark sources processed in the same transaction
-      - debug=true echoes db_user/session_user/loop/bot_member/recipient samples
+    Recipient resolution is done via members(loop_id) derived from author_member_id,
+    excluding {author_profile_id, bot_profile_id}.
+    All publish operations happen in a single DB transaction.
     """
-    dry_run = _as_bool(dry_run)
     if not x_user_id:
         raise HTTPException(status_code=400, detail="missing_bot_profile_id_header")
 
-    scanned = processed = inserted = skipped = 0
+    scanned = 0
+    processed = 0
+    inserted = 0
+    skipped = 0
     items: List[BotProcessItem] = []
-    flat_recips: List[str] = []
-
-    dbg_db_user = dbg_session_user = dbg_loop_id = dbg_bot_member = None
+    flat_recipients: List[str] = []
 
     try:
         with _get_conn() as conn:
-            # debug context (role + session)
-            if debug:
-                with conn.cursor() as cur:
-                    cur.execute("select current_user as u, session_user as s")
-                    row = cur.fetchone()
-                    if row:
-                        dbg_db_user = row["u"]
-                        dbg_session_user = row["s"]
-
             rows = _select_unprocessed(conn, thread_id=thread_id, limit=limit)
             scanned = len(rows)
+
             if not rows:
                 return BotProcessResponse(
                     stats=BotProcessStats(
-                        scanned=scanned, processed=processed, inserted=inserted,
-                        skipped=skipped, dry_run=dry_run,
-                        recipient_ids=[], db_user=dbg_db_user, session_user=dbg_session_user,
-                        loop_id=dbg_loop_id, bot_member_id=dbg_bot_member
+                        scanned=scanned,
+                        processed=processed,
+                        inserted=inserted,
+                        skipped=skipped,
+                        dry_run=dry_run,
+                        recipient_ids=[],
                     ),
                     items=[],
                 )
@@ -259,11 +228,11 @@ def process_bot_messages(
             to_publish: List[Dict[str, Any]] = []
             source_ids: List[str] = []
 
-            # compute loop/bot membership once (messages can be from different loops; handle per-row)
             for r in rows:
                 msg_id = r["id"]
                 author_profile_id = r["created_by"]
                 author_member_id = r.get("author_member_id")
+                content = r.get("content") or ""
                 thread = r["thread_id"]
 
                 if not author_member_id:
@@ -272,32 +241,19 @@ def process_bot_messages(
                     continue
 
                 loop_id = _loop_id_for_member(conn, author_member_id)
-                if debug and not dbg_loop_id:
-                    dbg_loop_id = loop_id
-
                 if not loop_id:
                     logger.warning("message %s could not resolve loop_id; skipping", msg_id)
                     skipped += 1
                     continue
 
-                bot_member_id = _bot_member_id_for_loop(conn, loop_id, x_user_id)
-                if debug and not dbg_bot_member:
-                    dbg_bot_member = bot_member_id
-
-                if not bot_member_id:
-                    logger.warning("bot is not a member of loop %s; skipping message %s", loop_id, msg_id)
-                    skipped += 1
-                    continue
-
                 exclude = [author_profile_id, x_user_id]
                 recipients = _recipients_for_loop(conn, loop_id, exclude_ids=exclude)
-                flat_recips.extend(recipients)
+                flat_recipients.extend(recipients)
 
                 previews: List[BotProcessItemPreview] = []
                 for pid in recipients:
-                    # NOTE: If you later wire encryption, encrypt here and set content_ciphertext accordingly
                     reply_text = generate_reply(
-                        human_text="",  # content is encrypted in DB; omit plaintext fetch in this path
+                        human_text=content,
                         author_profile_id=author_profile_id,
                         recipient_profile_id=pid,
                         thread_id=thread,
@@ -310,7 +266,7 @@ def process_bot_messages(
                                 "thread_id": thread,
                                 "created_at": _now_iso(),
                                 "recipient_profile_id": pid,
-                                "content_ciphertext": reply_text,  # TEMP: store plaintext in ciphertext column
+                                "content": reply_text,
                             }
                         )
 
@@ -323,7 +279,6 @@ def process_bot_messages(
                     ins, proc = _insert_bot_messages_and_mark_processed(
                         conn,
                         bot_profile_id=x_user_id,
-                        bot_member_id=bot_member_id,  # last loop’s bot member_id; safe because all rows share same loop under given thread_id
                         to_publish=to_publish,
                         source_message_ids=source_ids,
                     )
@@ -332,10 +287,12 @@ def process_bot_messages(
 
         return BotProcessResponse(
             stats=BotProcessStats(
-                scanned=scanned, processed=processed, inserted=inserted, skipped=skipped,
-                dry_run=dry_run, recipient_ids=list(dict.fromkeys(flat_recips)),
-                db_user=dbg_db_user, session_user=dbg_session_user,
-                loop_id=dbg_loop_id, bot_member_id=dbg_bot_member
+                scanned=scanned,
+                processed=processed,
+                inserted=inserted,
+                skipped=skipped,
+                dry_run=dry_run,
+                recipient_ids=list(dict.fromkeys(flat_recipients)),
             ),
             items=items,
         )
