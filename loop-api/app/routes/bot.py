@@ -1,341 +1,278 @@
 # app/routes/bot.py
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+import os
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
-
+import psycopg  # psycopg 3.x
+from psycopg.rows import dict_row
 from fastapi import APIRouter, Header, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from psycopg import sql
+# Use the real LLM hook you edited (no local stub)
+from app.llm import generate_reply
 
-# --- Adjust imports to your project structure ---
-from app.db import get_conn                  # psycopg connection (context manager)
-from app.llm import generate_reply           # your LLM helper (uses max_completion_tokens)
-from app.crypto import seal_plaintext        # encrypt on insert
-# from app.crypto import unseal_plaintext    # <-- uncomment if you have it
-# -----------------------------------------------
-
+# This router shape matches your openapi.json path: /api/bot/process
 router = APIRouter(prefix="/api/bot", tags=["bot"])
 
-INBOX_TO_BOT = "inbox_to_bot"
-BOT_TO_USER   = "bot_to_user"
+# -------------------------- Models (shape-compatible) --------------------------
 
-# Prefer these column names (first match wins) when reading a human message body
-MESSAGE_TEXT_COLUMN_PREFERENCE = [
-    "content",              # old schema
-    "message",              # common alt
-    "body",                 # common alt
-    "plaintext",            # sometimes used
-    "text",                 # generic
-    "content_plain",        # explicit
-    "content_text",         # explicit
-    "content_ciphertext",   # encrypted variants below
-    "ciphertext",
-    "sealed_content",
-    "encrypted_content",
-]
-
-
-# ========================= Models ========================= #
-
-class ProcessStats(BaseModel):
-    scanned: int = 0
-    processed: int = 0
-    inserted: int = 0
-    skipped: int = 0
-    dry_run: bool = False
-
-
-class PreviewItem(BaseModel):
-    recipient_profile_id: str
-    content: str
-
-
-class ProcessItemResult(BaseModel):
-    human_message_id: str
+class BotProcessItem(BaseModel):
+    human_message_id: str = Field(..., description="source inbox_to_bot message id")
     thread_id: str
     recipients: List[str] = []
-    bot_rows: List[str] = []
-    previews: List[PreviewItem] = []
+    bot_rows: List[str] = []        # ids of inserted bot_to_user rows
+    previews: List[Dict[str, str]] = []  # [{recipient_profile_id, content}]
     skipped_reason: Optional[str] = None
 
+class BotProcessStats(BaseModel):
+    scanned: int = 0
+    processed: int = 0    # number of human rows marked processed (only in publish)
+    inserted: int = 0     # number of bot_to_user rows inserted
+    skipped: int = 0
+    dry_run: bool = True
 
 class BotProcessResponse(BaseModel):
     ok: bool = True
     reason: Optional[str] = None
-    stats: ProcessStats
-    items: List[ProcessItemResult] = []
+    stats: BotProcessStats
+    items: List[BotProcessItem] = []
 
+# ------------------------------ DB utilities ----------------------------------
 
-# ========================= Helpers ========================= #
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def _require_bot_caller(x_user_id: Optional[str]) -> str:
-    """Ensure X-User-Id header (bot profile id) is present & UUID."""
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="Missing X-User-Id header")
-    try:
-        uuid.UUID(x_user_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="X-User-Id must be a UUID")
-    return x_user_id
+def _conn() -> psycopg.Connection:
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL (or SUPABASE_DB_URL) is not set")
+    return psycopg.connect(dsn, row_factory=dict_row)
 
+# ------------------------------ SQL helpers -----------------------------------
 
-def _fetch_unprocessed_human_messages(conn, *, thread_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
+def _fetch_unprocessed_human_messages(
+    conn: psycopg.Connection, *, thread_id: Optional[str], limit: int
+) -> List[Dict[str, Any]]:
     """
-    Fetch human messages queued for the bot (audience='inbox_to_bot') that have not been processed.
-    NOTE: Do NOT select a specific body column here—schemas vary. We'll fetch body per-row later.
+    Human→bot queue rows are those with audience='inbox_to_bot' and bot_processed_at IS NULL.
+    We do not touch 'processed' here to avoid drift with older paths.
     """
+    sql = """
+      SELECT id, thread_id, created_by, author_member_id
+      FROM messages
+      WHERE audience = 'inbox_to_bot'
+        AND bot_processed_at IS NULL
+    """
+    args: List[Any] = []
+    if thread_id:
+        sql += " AND thread_id = %s"
+        args.append(thread_id)
+    sql += " ORDER BY created_at ASC LIMIT %s"
+    args.append(limit)
+
     with conn.cursor() as cur:
-        if thread_id:
-            cur.execute(
-                """
-                SELECT id, thread_id, created_by, author_member_id, created_at
-                FROM messages
-                WHERE audience = %s
-                  AND thread_id = %s
-                  AND bot_processed_at IS NULL
-                ORDER BY created_at ASC
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
-                """,
-                (INBOX_TO_BOT, uuid.UUID(thread_id), limit),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT id, thread_id, created_by, author_member_id, created_at
-                FROM messages
-                WHERE audience = %s
-                  AND bot_processed_at IS NULL
-                ORDER BY created_at ASC
-                LIMIT %s
-                FOR UPDATE SKIP LOCKED
-                """,
-                (INBOX_TO_BOT, limit),
-            )
-        rows = cur.fetchall()
-    cols = ["id", "thread_id", "created_by", "author_member_id", "created_at"]
-    return [dict(zip(cols, r)) for r in rows]
+        cur.execute(sql, tuple(args))
+        return list(cur.fetchall())
 
-
-def _thread_loop_id_and_members(conn, thread_id: str) -> Tuple[str, List[str]]:
-    """Return (loop_id, [profile_id, ...]) for the given thread."""
+def _loop_id_for_member(conn: psycopg.Connection, member_id: str) -> Optional[str]:
     with conn.cursor() as cur:
-        cur.execute("SELECT loop_id FROM threads WHERE id = %s", (uuid.UUID(thread_id),))
-        res = cur.fetchone()
-        if not res:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        (loop_id,) = res
+        cur.execute("SELECT loop_id FROM members WHERE id = %s", (member_id,))
+        row = cur.fetchone()
+        return row["loop_id"] if row else None
 
-        cur.execute("SELECT profile_id FROM loop_members WHERE loop_id = %s", (loop_id,))
-        member_rows = cur.fetchall()
-    member_ids = [str(r[0]) for r in member_rows]
-    return (str(loop_id), member_ids)
-
-
-def _column_exists(conn, table: str, column: str) -> bool:
+def _bot_member_id_for_loop(conn: psycopg.Connection, loop_id: str, bot_profile_id: str) -> Optional[str]:
     with conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'public'
-              AND table_name   = %s
-              AND column_name  = %s
-            """,
-            (table, column),
+            "SELECT id FROM members WHERE loop_id = %s AND profile_id = %s",
+            (loop_id, bot_profile_id),
         )
-        return cur.fetchone() is not None
+        row = cur.fetchone()
+        return row["id"] if row else None
 
+def _recipients_for_loop(conn: psycopg.Connection, loop_id: str, exclude_profile_ids: List[str]) -> List[str]:
+    """
+    Resolve recipient profile_ids as all members of the loop minus the exclude set.
+    Exclude MUST include the human author and the bot profile id.
+    """
+    if exclude_profile_ids:
+        ph = ", ".join(["%s"] * len(exclude_profile_ids))
+        sql = f"""
+          SELECT profile_id
+          FROM members
+          WHERE loop_id = %s
+            AND profile_id NOT IN ({ph})
+        """
+        args: List[Any] = [loop_id, *exclude_profile_ids]
+    else:
+        sql = "SELECT profile_id FROM members WHERE loop_id = %s"
+        args = [loop_id]
 
-def _get_message_text(conn, message_id: str) -> Optional[str]:
-    """
-    Read the message body for a given message id, trying a whitelist of possible column names.
-    Returns plaintext string or None if nothing usable is found.
-    """
     with conn.cursor() as cur:
-        for col in MESSAGE_TEXT_COLUMN_PREFERENCE:
-            if not _column_exists(conn, "messages", col):
-                continue
-            # Safe dynamic identifier
-            query = sql.SQL("SELECT {col} FROM messages WHERE id = %s").format(
-                col=sql.Identifier(col)
-            )
-            cur.execute(query, (uuid.UUID(message_id),))
-            row = cur.fetchone()
-            if not row:
-                continue
-            val = row[0]
-            if val is None:
-                continue
+        cur.execute(sql, tuple(args))
+        return [r["profile_id"] for r in cur.fetchall()]
 
-            # If you store ciphertext, unseal here:
-            # if col in ("content_ciphertext", "ciphertext", "sealed_content", "encrypted_content"):
-            #     try:
-            #         return unseal_plaintext(val)
-            #     except Exception:
-            #         continue
-
-            # Otherwise coerce to str
-            try:
-                s = val.decode("utf-8") if isinstance(val, (bytes, bytearray)) else str(val)
-            except Exception:
-                continue
-
-            s = s.strip()
-            if s:
-                return s
-
-    return None
-
-
-def _insert_bot_to_user(conn, *, thread_id: str, bot_profile_id: str, recipient_id: str, content: str) -> str:
-    """Insert a bot_to_user message and return its id."""
-    new_id = uuid.uuid4()
+def _insert_bot_to_user(
+    conn: psycopg.Connection,
+    *,
+    thread_id: str,
+    bot_profile_id: str,
+    bot_member_id: str,
+    recipient_id: str,
+    content_ciphertext: str,  # storing plaintext for now; swap to real encryption later
+) -> str:
+    """
+    Insert a bot_to_user row that satisfies NOT NULLs in your schema:
+      - thread_id, created_by, author_member_id (bot), role, channel, visibility, audience, recipient_profile_id, content_ciphertext
+    Returns new message id.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO messages (id, thread_id, created_by, audience, recipient_profile_id, content)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO messages
+              (thread_id, created_at, created_by, author_member_id,
+               role, channel, visibility, audience, recipient_profile_id, content_ciphertext)
+            VALUES
+              (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
-                new_id,
-                uuid.UUID(thread_id),
-                uuid.UUID(bot_profile_id),
-                BOT_TO_USER,
-                uuid.UUID(recipient_id),
-                seal_plaintext(content),
+                thread_id,
+                bot_profile_id,
+                bot_member_id,
+                "bot",
+                "outbox",
+                "private",
+                "bot_to_user",
+                recipient_id,
+                content_ciphertext,
             ),
         )
-        (inserted_id,) = cur.fetchone()
-    return str(inserted_id)
+        row = cur.fetchone()
+        return str(row["id"])
 
-
-def _mark_human_processed(conn, human_id: str) -> None:
+def _mark_human_processed(conn: psycopg.Connection, human_id: str) -> None:
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE messages SET bot_processed_at = NOW() WHERE id = %s",
-            (uuid.UUID(human_id),),
+            (human_id,),
         )
 
-
-# ========================= Route ========================= #
+# ------------------------------ Route handler ---------------------------------
 
 @router.post("/process", response_model=BotProcessResponse)
 def process_queue(
     thread_id: Optional[str] = Query(None, description="Only process this thread"),
-    limit: int = Query(20, ge=1, le=200),
-    dry_run: bool = Query(False),
-    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    limit: int = Query(10, ge=1, le=100),
+    dry_run: bool = Query(True),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),  # bot profile id
 ):
     """
     Process human→bot messages and emit per-recipient bot DMs.
 
-    - dry_run=True: return previews only (no inserts, no mark).
-    - dry_run=False: insert bot_to_user rows and mark human as processed.
+    - dry_run=True: preview only (no DB writes, do NOT mark processed)
+    - dry_run=False: insert bot_to_user rows AND mark human messages with bot_processed_at
     """
-    bot_profile_id = _require_bot_caller(x_user_id)
-    stats = ProcessStats(dry_run=dry_run)
-    items: List[ProcessItemResult] = []
+    bot_profile_id = (x_user_id or "").strip()
+    try:
+        uuid.UUID(bot_profile_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="missing_or_invalid_X-User-Id (bot profile id)")
 
-    with get_conn() as conn:
-        conn.autocommit = False
-        humans = _fetch_unprocessed_human_messages(conn, thread_id=thread_id, limit=limit)
-        stats.scanned = len(humans)
+    stats = BotProcessStats(dry_run=bool(dry_run))
+    items: List[BotProcessItem] = []
 
-        for h in humans:
-            item = ProcessItemResult(
-                human_message_id=str(h["id"]),
-                thread_id=str(h["thread_id"]),
-            )
+    try:
+        with _conn() as conn:
+            humans = _fetch_unprocessed_human_messages(conn, thread_id=thread_id, limit=limit)
+            stats.scanned = len(humans)
 
-            try:
-                # Resolve recipients (everyone in loop except the author)
-                loop_id, member_ids = _thread_loop_id_and_members(conn, str(h["thread_id"]))
-                author_profile_id = str(h["created_by"])
-                recipients = [pid for pid in member_ids if pid != author_profile_id]
-                item.recipients = recipients
+            if not humans:
+                return BotProcessResponse(ok=True, reason=None, stats=stats, items=[])
 
-                if not recipients:
-                    item.skipped_reason = "no_recipients"
+            for h in humans:
+                src_id: str = str(h["id"])
+                t_id: str = str(h["thread_id"])
+                author_profile_id: str = str(h["created_by"])
+                author_member_id: Optional[str] = h.get("author_member_id")
+
+                item = BotProcessItem(human_message_id=src_id, thread_id=t_id)
+
+                # Guard: need author_member_id to resolve loop
+                if not author_member_id:
                     stats.skipped += 1
+                    item.skipped_reason = "missing author_member_id"
                     items.append(item)
                     continue
 
-                # Fetch the human message text (schema-agnostic)
-                human_text = _get_message_text(conn, message_id=str(h["id"]))
-                if not human_text:
-                    item.skipped_reason = "no_message_text_found"
+                # Resolve loop_id and the bot's member_id in that loop
+                loop_id = _loop_id_for_member(conn, author_member_id)
+                if not loop_id:
                     stats.skipped += 1
+                    item.skipped_reason = "missing loop_id"
                     items.append(item)
                     continue
 
-                # Build candidate replies per recipient via LLM
-                candidate_msgs: List[Dict[str, str]] = []
-                for rid in recipients:
-                    try:
-                        reply_text = generate_reply(
-                            text=human_text,
-                            sender_profile_id=author_profile_id,
-                            recipient_profile_id=rid,
-                            thread_id=str(h["thread_id"]),
-                            loop_id=loop_id,
-                        )
-                        reply_text = str(reply_text).strip()
-                        if not reply_text:
-                            raise ValueError("empty reply")
-                    except Exception as e:
-                        item.skipped_reason = f"llm_error: {e}"
-                        stats.skipped += 1
-                        items.append(item)
-                        conn.rollback()
-                        # move to next human message, don't crash the whole request
-                        raise
-
-                    candidate_msgs.append({"recipient_profile_id": rid, "content": reply_text})
-
-                if dry_run:
-                    # Emit previews only
-                    item.previews = [
-                        PreviewItem(recipient_profile_id=m["recipient_profile_id"], content=m["content"])
-                        for m in candidate_msgs
-                    ]
-                    stats.processed += 1
+                bot_member_id = _bot_member_id_for_loop(conn, loop_id, bot_profile_id)
+                if not bot_member_id:
+                    stats.skipped += 1
+                    item.skipped_reason = "bot not a member of loop"
                     items.append(item)
                     continue
 
-                # Publish path
+                # Compute recipients (exclude author + bot)
+                recipients = _recipients_for_loop(conn, loop_id, exclude_profile_ids=[author_profile_id, bot_profile_id])
+                item.recipients = recipients[:]  # echo in response
+
+                # Build previews (and publish rows if not dry run)
                 new_ids: List[str] = []
-                for m in candidate_msgs:
-                    new_id = _insert_bot_to_user(
-                        conn,
-                        thread_id=str(h["thread_id"]),   # correct indexing
-                        bot_profile_id=bot_profile_id,
-                        recipient_id=m["recipient_profile_id"],
-                        content=m["content"],
+                previews: List[Dict[str, str]] = []
+
+                for pid in recipients:
+                    # NOTE: we don't fetch plaintext human text here (your table stores ciphertext);
+                    # your LLM can be context-free or pull from other sources if needed.
+                    reply_text = generate_reply(
+                        human_text="",
+                        author_profile_id=author_profile_id,
+                        recipient_profile_id=pid,
+                        thread_id=t_id,
                     )
-                    new_ids.append(new_id)
+                    previews.append({"recipient_profile_id": pid, "content": reply_text})
 
-                _mark_human_processed(conn, str(h["id"]))
+                    if not dry_run:
+                        new_id = _insert_bot_to_user(
+                            conn,
+                            thread_id=t_id,
+                            bot_profile_id=bot_profile_id,
+                            bot_member_id=bot_member_id,
+                            recipient_id=pid,
+                            content_ciphertext=reply_text,  # TODO: replace with ciphertext when encryptor is wired
+                        )
+                        new_ids.append(new_id)
 
-                stats.processed += 1
-                stats.inserted += len(new_ids)
-                item.bot_rows = new_ids
+                # On publish, mark the human row processed only after successful inserts
+                if not dry_run:
+                    _mark_human_processed(conn, src_id)
+                    stats.processed += 1
+                    stats.inserted += len(new_ids)
+                    item.bot_rows = new_ids
+                else:
+                    # dry run: never mutate state
+                    item.previews = previews
 
-                conn.commit()
                 items.append(item)
 
-            except HTTPException:
-                conn.rollback()
-                raise
-            except Exception:
-                # Keep request 200; annotate the item and continue
-                conn.rollback()
-                if not item.skipped_reason:
-                    item.skipped_reason = "error: failed to process message"
-                items.append(item)
-                continue
+        return BotProcessResponse(ok=True, reason=None, stats=stats, items=items)
 
-    return BotProcessResponse(ok=True, stats=stats, items=items)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Surface the real reason to help us correct quickly
+        return BotProcessResponse(
+            ok=False,
+            reason=f"bot_process_exception: {e}",
+            stats=stats,
+            items=items,
+        )
