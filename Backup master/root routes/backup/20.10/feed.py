@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import re
-import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 from uuid import UUID
@@ -18,11 +17,6 @@ router = APIRouter(prefix="/api", tags=["feed"])
 # openai test
 @router.get("/feed/selftest")
 def feed_selftest():
-    """
-    Lightweight runtime smoke check for the OpenAI path.
-    - Omits temperature to stay model-agnostic.
-    - Returns a short sample and simple timing in ms.
-    """
     try:
         from openai import OpenAI
         api_key = os.getenv("OPENAI_API_KEY")
@@ -30,22 +24,16 @@ def feed_selftest():
             return {"ok": False, "reason": "missing OPENAI_API_KEY"}
         client = OpenAI(api_key=api_key)
         model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-        t0 = time.monotonic()
         r = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "Reply with a single short sentence."},
                 {"role": "user", "content": "Say hello from Loop API."}
             ],
-            # No temperature (model default), keep tiny limit
             max_completion_tokens=20,
+            temperature=0
         )
-        ms = int((time.monotonic() - t0) * 1000)
-        sample = (r.choices[0].message.content or "").strip()
-        if len(sample) > 120:
-            sample = sample[:120].rstrip()
-        return {"ok": True, "engine": "openai", "ms": ms, "sample": sample}
+        return {"ok": True, "engine": "openai", "sample": r.choices[0].message.content.strip()}
     except Exception as e:
         return {"ok": False, "reason": "openai_exception", "detail": str(e)[:300]}
 
