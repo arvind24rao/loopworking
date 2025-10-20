@@ -11,12 +11,6 @@ from psycopg.rows import dict_row
 from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-import logging
-import time
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
 # Use your real LLM response
 from app.llm import generate_reply
 
@@ -240,7 +234,7 @@ def process_queue(
     - dry_run=False → insert bot_to_user rows + mark source human with bot_processed_at
     """
     bot_profile_id = _require_bot_id(x_user_id)
-    start_time = time.time()
+
     stats = BotProcessStats(dry_run=bool(dry_run))
     items: List[BotProcessItem] = []
 
@@ -334,16 +328,6 @@ def process_queue(
                     item.skipped_reason = item.skipped_reason or "empty_llm_reply"
 
                 items.append(item)
-            # --- lightweight observability ---
-            elapsed_ms = int((time.time() - start_time) * 1000) if 'start_time' in locals() else 0
-            if stats.scanned > 0 or stats.inserted > 0:
-                logger.info(
-                    f"bot.process thread={thread_id or '-'} dry_run={dry_run} "
-                    f"scanned={stats.scanned} processed={stats.processed} "
-                    f"inserted={stats.inserted} skipped={stats.skipped} "
-                    f"ms={elapsed_ms}"
-                )
-            # ---------------------------------
 
         return BotProcessResponse(ok=True, reason=None, stats=stats, items=items)
 
