@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import os
 import uuid
+from uuid import UUID as UUIDT
 
 import psycopg  # psycopg 3.x
 from psycopg.rows import dict_row
@@ -34,12 +35,18 @@ router = APIRouter(prefix="/api/bot", tags=["bot"])
 
 # =============================== Models ===============================
 
+class Preview(BaseModel):
+    recipient_profile_id: UUIDT
+    content: str
+
 class BotProcessItem(BaseModel):
     human_message_id: str = Field(..., description="source inbox_to_bot message id")
     thread_id: str
-    recipients: List[str] = []
+    # recipients: List[str] = []
+    recipients: List[UUIDT] = []
     bot_rows: List[str] = []               # ids of inserted bot_to_user rows (publish only)
-    previews: List[Dict[str, str]] = []    # shown only in dry_run
+    # previews: List[Dict[str, str]] = []    # shown only in dry_run
+    previews: List[Preview]] = []    # shown only in dry_run
     skipped_reason: Optional[str] = None
 
 class BotProcessStats(BaseModel):
@@ -316,7 +323,8 @@ def process_queue(
                         )
 
                     if dry_run:
-                        previews.append({"recipient_profile_id": pid, "content": reply_text})
+                        # previews.append({"recipient_profile_id": pid, "content": reply_text})
+                        previews.append(Preview(recipient_profile_id=pid, content=reply_text))
                     else:
                         if reply_text:
                             new_id = _insert_bot_dm(
