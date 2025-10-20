@@ -57,31 +57,6 @@ def _require_bot_id(x_user_id: Optional[str]) -> str:
         raise HTTPException(status_code=400, detail="Invalid X-User-Id (must be UUID)")
     return str(x_user_id)
 
-# =============================== Helpers ==============================
-
-def _decode_ciphertext(c: Optional[str]) -> str:
-    """
-    Align with feed.py: content is currently plaintext; if legacy prefix 'cipher:' exists, strip it.
-    """
-    if not c:
-        return ""
-    return c[7:].strip() if c.startswith("cipher:") else c
-
-def _now_singapore() -> tuple[str, str, str]:
-    """
-    Produce (current_date, current_time, timezone_str) for the model prompt.
-    Format: date 'DD Month YYYY' (zero-padded day is acceptable), time 'HH:MM' 24h.
-    """
-    try:
-        from zoneinfo import ZoneInfo  # py3.9+
-        tz = ZoneInfo("Asia/Singapore")
-    except Exception:
-        tz = timezone.utc
-    now = datetime.now(tz)
-    current_date = now.strftime("%d %B %Y")
-    current_time = now.strftime("%H:%M")
-    return current_date, current_time, "Asia/Singapore"
-
 # =============================== SQL helpers ==========================
 
 def _fetch_unprocessed_humans(
@@ -90,10 +65,9 @@ def _fetch_unprocessed_humans(
     """
     Queue = audience='inbox_to_bot' AND bot_processed_at IS NULL
     (Intentionally not using messages.processed.)
-    NOTE: include content_ciphertext so we can pass the actual human text to the LLM.
     """
     sql = """
-      SELECT id, thread_id, created_by, author_member_id, content_ciphertext
+      SELECT id, thread_id, created_by, author_member_id
       FROM messages
       WHERE audience = 'inbox_to_bot'
         AND bot_processed_at IS NULL
@@ -223,15 +197,11 @@ def process_queue(
             if not humans:
                 return BotProcessResponse(ok=True, reason=None, stats=stats, items=[])
 
-            # Timestamp context for the model (Asia/Singapore by default)
-            current_date, current_time, tz_name = _now_singapore()
-
             for h in humans:
                 src_id = str(h["id"])
                 t_id = str(h["thread_id"])
                 author_profile_id = str(h["created_by"])
                 author_member_id = h.get("author_member_id")
-                human_plaintext = _decode_ciphertext(h.get("content_ciphertext"))
 
                 item = BotProcessItem(human_message_id=src_id, thread_id=t_id)
 
@@ -263,37 +233,25 @@ def process_queue(
                 previews: List[Dict[str, str]] = []
                 new_ids: List[str] = []
 
-                # If we have no human text, still add previews (empty) but don't insert
                 for pid in recipients:
-                    # Build model input using your relay-composer contract
-                    # Prefer structured multi-message with author label and the human text.
-                    reply_text = ""
-                    if human_plaintext:
-                        reply_text = generate_reply(
-                            context_messages=[{"author": author_profile_id, "text": human_plaintext}],
-                            current_date=current_date,
-                            current_time=current_time,
-                            timezone=tz_name,
-                            user_id=f"loop:{pid}",
-                        )
-                        # Trim/guardrail is handled inside llm wrapper; reply_text may still be "" in edge cases.
+                    reply_text = generate_reply(
+                        human_text="",
+                        author_profile_id=author_profile_id,
+                        recipient_profile_id=pid,
+                        thread_id=t_id,
+                    )
+                    previews.append({"recipient_profile_id": pid, "content": reply_text})
 
-                    if dry_run:
-                        previews.append({"recipient_profile_id": pid, "content": reply_text})
-                    else:
-                        if reply_text:
-                            new_id = _insert_bot_dm(
-                                conn,
-                                thread_id=t_id,
-                                bot_profile_id=bot_profile_id,
-                                bot_member_id=str(bot_member_id),
-                                recipient_profile_id=pid,
-                                content_ciphertext=reply_text,
-                            )
-                            new_ids.append(new_id)
-                        else:
-                            # Count a skip for visibility when model returns empty
-                            stats.skipped += 1
+                    if not dry_run:
+                        new_id = _insert_bot_dm(
+                            conn,
+                            thread_id=t_id,
+                            bot_profile_id=bot_profile_id,
+                            bot_member_id=str(bot_member_id),
+                            recipient_profile_id=pid,
+                            content_ciphertext=reply_text,
+                        )
+                        new_ids.append(new_id)
 
                 if not dry_run:
                     _mark_human_processed(conn, src_id)
@@ -302,10 +260,6 @@ def process_queue(
                     item.bot_rows = new_ids
                 else:
                     item.previews = previews
-
-                # If absolutely nothing could be generated, annotate item
-                if not dry_run and not new_ids:
-                    item.skipped_reason = item.skipped_reason or "empty_llm_reply"
 
                 items.append(item)
 
