@@ -17,6 +17,15 @@ import time
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# Ensure logs reach stdout even if the root logger isn't configured
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setLevel(logging.INFO)
+    _h.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(_h)
+    logger.propagate = True  # also bubble to root/uvicorn if present
+
+
 # Use your real LLM response
 from app.llm import generate_reply
 
