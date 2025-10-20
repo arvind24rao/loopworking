@@ -163,7 +163,8 @@ def _chat_with_retry(messages: List[Dict[str, str]], user_id: Optional[str] = No
             resp = _client.chat.completions.create(
                 model=LLM_MODEL,
                 messages=messages,
-                max_tokens=LLM_MAX_TOKENS,
+                # IMPORTANT FIX: use max_completion_tokens for current models
+                max_completion_tokens=LLM_MAX_TOKENS,
                 temperature=LLM_TEMPERATURE,
                 top_p=LLM_TOP_P,
                 user=(user_id or None),

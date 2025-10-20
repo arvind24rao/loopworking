@@ -1,0 +1,2141 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+app/
+  routes/
+    __init__.py
+    bot.py
+    diag.py
+    feed.py
+    messages.py
+  services/
+    recipients.py
+  __init__.py
+  bot.py
+  crypto.py
+  db.py
+  diagnostics.py
+  llm.py
+  main.py
+  models.py
+  requirements.txt
+  supa.py
+demo.html
+Makefile
+requirements.lock
+requirements.txt
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="app/routes/bot.py">
+# app/routes/bot.py
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+import os
+import uuid
+
+import psycopg  # psycopg 3.x
+from psycopg.rows import dict_row
+from fastapi import APIRouter, Header, HTTPException, Query
+from pydantic import BaseModel, Field
+
+# Use your real LLM response
+from app.llm import generate_reply
+
+# Path = /api/bot/process (as in openapi.json)
+router = APIRouter(prefix="/api/bot", tags=["bot"])
+
+# =============================== Models ===============================
+
+class BotProcessItem(BaseModel):
+    human_message_id: str = Field(..., description="source inbox_to_bot message id")
+    thread_id: str
+    recipients: List[str] = []
+    bot_rows: List[str] = []               # ids of inserted bot_to_user rows (publish only)
+    previews: List[Dict[str, str]] = []    # shown only in dry_run
+    skipped_reason: Optional[str] = None
+
+class BotProcessStats(BaseModel):
+    scanned: int = 0
+    processed: int = 0        # human rows marked processed (publish only)
+    inserted: int = 0         # bot_to_user rows inserted
+    skipped: int = 0
+    dry_run: bool = True
+
+class BotProcessResponse(BaseModel):
+    ok: bool = True
+    reason: Optional[str] = None
+    stats: BotProcessStats
+    items: List[BotProcessItem] = []
+
+# =============================== DB utils =============================
+
+def _conn() -> psycopg.Connection:
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL (or SUPABASE_DB_URL) is not set")
+    return psycopg.connect(dsn, row_factory=dict_row)
+
+def _require_bot_id(x_user_id: Optional[str]) -> str:
+    if not x_user_id:
+        raise HTTPException(status_code=401, detail="Missing X-User-Id (bot profile id required)")
+    try:
+        uuid.UUID(str(x_user_id))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid X-User-Id (must be UUID)")
+    return str(x_user_id)
+
+# =============================== SQL helpers ==========================
+
+def _fetch_unprocessed_humans(
+    conn: psycopg.Connection, *, thread_id: Optional[str], limit: int
+) -> List[Dict[str, Any]]:
+    """
+    Queue = audience='inbox_to_bot' AND bot_processed_at IS NULL
+    (Intentionally not using messages.processed.)
+    """
+    sql = """
+      SELECT id, thread_id, created_by, author_member_id
+      FROM messages
+      WHERE audience = 'inbox_to_bot'
+        AND bot_processed_at IS NULL
+    """
+    args: List[Any] = []
+    if thread_id:
+        sql += " AND thread_id = %s"
+        args.append(thread_id)
+    sql += " ORDER BY created_at ASC LIMIT %s"
+    args.append(limit)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(args))
+        return list(cur.fetchall())
+
+def _loop_id_for_member(conn: psycopg.Connection, member_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT loop_id FROM members WHERE id = %s", (member_id,))
+        row = cur.fetchone()
+        return row["loop_id"] if row else None
+
+def _bot_member_id_for_loop(conn: psycopg.Connection, loop_id: str, bot_profile_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM members WHERE loop_id = %s AND profile_id = %s",
+            (loop_id, bot_profile_id),
+        )
+        row = cur.fetchone()
+        return row["id"] if row else None
+
+def _recipients_for_loop(conn: psycopg.Connection, loop_id: str, exclude_profile_ids: List[str]) -> List[str]:
+    """
+    recipients = members.profile_id in loop MINUS exclude set
+    (exclude must include author_profile_id and bot_profile_id)
+    """
+    if exclude_profile_ids:
+        ph = ", ".join(["%s"] * len(exclude_profile_ids))
+        sql = f"""
+          SELECT profile_id
+          FROM members
+          WHERE loop_id = %s
+            AND profile_id NOT IN ({ph})
+        """
+        args: List[Any] = [loop_id, *exclude_profile_ids]
+    else:
+        sql = "SELECT profile_id FROM members WHERE loop_id = %s"
+        args = [loop_id]
+
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(args))
+        return [r["profile_id"] for r in cur.fetchall()]
+
+def _insert_bot_dm(
+    conn: psycopg.Connection,
+    *,
+    thread_id: str,
+    bot_profile_id: str,
+    bot_member_id: str,
+    recipient_profile_id: str,
+    content_ciphertext: str,   # plaintext for now; replace when encryption is wired
+) -> str:
+    """
+    Minimal, schema-correct insert:
+      Only set the fields that must be explicit:
+        - thread_id
+        - created_by (bot profile id)
+        - author_member_id (bot's member id)
+        - audience ('bot_to_user')
+        - recipient_profile_id
+        - content_ciphertext
+      Let DB defaults populate role/channel/visibility/created_at.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO messages
+              (thread_id, created_by, author_member_id,
+               audience, recipient_profile_id, content_ciphertext)
+            VALUES
+              (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                thread_id,
+                bot_profile_id,
+                bot_member_id,
+                "bot_to_user",
+                recipient_profile_id,
+                content_ciphertext,
+            ),
+        )
+        row = cur.fetchone()
+        return str(row["id"])
+
+def _mark_human_processed(conn: psycopg.Connection, human_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE messages SET bot_processed_at = NOW() WHERE id = %s AND bot_processed_at IS NULL",
+            (human_id,),
+        )
+
+# =============================== Route ================================
+
+@router.post("/process", response_model=BotProcessResponse)
+def process_queue(
+    thread_id: Optional[str] = Query(None, description="Only process this thread"),
+    limit: int = Query(10, ge=1, le=100),
+    dry_run: bool = Query(True),
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),  # bot profile id
+):
+    """
+    Process human→bot messages and fan out bot→user DMs.
+
+    - dry_run=True  → preview only (no DB writes; DO NOT mark processed)
+    - dry_run=False → insert bot_to_user rows + mark source human with bot_processed_at
+    """
+    bot_profile_id = _require_bot_id(x_user_id)
+
+    stats = BotProcessStats(dry_run=bool(dry_run))
+    items: List[BotProcessItem] = []
+
+    try:
+        with _conn() as conn:
+            humans = _fetch_unprocessed_humans(conn, thread_id=thread_id, limit=limit)
+            stats.scanned = len(humans)
+
+            if not humans:
+                return BotProcessResponse(ok=True, reason=None, stats=stats, items=[])
+
+            for h in humans:
+                src_id = str(h["id"])
+                t_id = str(h["thread_id"])
+                author_profile_id = str(h["created_by"])
+                author_member_id = h.get("author_member_id")
+
+                item = BotProcessItem(human_message_id=src_id, thread_id=t_id)
+
+                # Need author's member to resolve loop
+                if not author_member_id:
+                    stats.skipped += 1
+                    item.skipped_reason = "missing author_member_id"
+                    items.append(item)
+                    continue
+
+                loop_id = _loop_id_for_member(conn, str(author_member_id))
+                if not loop_id:
+                    stats.skipped += 1
+                    item.skipped_reason = "missing loop_id"
+                    items.append(item)
+                    continue
+
+                bot_member_id = _bot_member_id_for_loop(conn, loop_id, bot_profile_id)
+                if not bot_member_id:
+                    stats.skipped += 1
+                    item.skipped_reason = "bot not a member of loop"
+                    items.append(item)
+                    continue
+
+                # recipients = everyone in loop except {author, bot}
+                recipients = _recipients_for_loop(conn, loop_id, exclude_profile_ids=[author_profile_id, bot_profile_id])
+                item.recipients = recipients[:]
+
+                previews: List[Dict[str, str]] = []
+                new_ids: List[str] = []
+
+                for pid in recipients:
+                    reply_text = generate_reply(
+                        human_text="",
+                        author_profile_id=author_profile_id,
+                        recipient_profile_id=pid,
+                        thread_id=t_id,
+                    )
+                    previews.append({"recipient_profile_id": pid, "content": reply_text})
+
+                    if not dry_run:
+                        new_id = _insert_bot_dm(
+                            conn,
+                            thread_id=t_id,
+                            bot_profile_id=bot_profile_id,
+                            bot_member_id=str(bot_member_id),
+                            recipient_profile_id=pid,
+                            content_ciphertext=reply_text,
+                        )
+                        new_ids.append(new_id)
+
+                if not dry_run:
+                    _mark_human_processed(conn, src_id)
+                    stats.processed += 1
+                    stats.inserted += len(new_ids)
+                    item.bot_rows = new_ids
+                else:
+                    item.previews = previews
+
+                items.append(item)
+
+        return BotProcessResponse(ok=True, reason=None, stats=stats, items=items)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Bubble up the real error text to speed up fixes
+        return BotProcessResponse(
+            ok=False,
+            reason=f"bot_process_exception: {e}",
+            stats=stats,
+            items=items,
+        )
+</file>
+
+<file path="app/routes/diag.py">
+from fastapi import APIRouter
+import os
+from urllib.parse import urlparse
+
+router = APIRouter(prefix="/health")
+
+@router.get("/dbinfo")
+def dbinfo():
+    raw = os.getenv("DATABASE_URL", "")
+    parsed = urlparse(raw) if raw else None
+    host = parsed.hostname if parsed else None
+    scheme = parsed.scheme if parsed else None
+    # mask password if present
+    safe = raw
+    if "@" in safe and "://" in safe:
+        try:
+            prefix, rest = safe.split("://", 1)
+            userpass, hostrest = rest.split("@", 1)
+            if ":" in userpass:
+                user, _pwd = userpass.split(":", 1)
+                safe = f"{prefix}://{user}:***@{hostrest}"
+        except Exception:
+            pass
+    return {
+        "ok": bool(raw),
+        "scheme": scheme,
+        "host": host,
+        "dsn_preview": safe,
+    }
+</file>
+
+<file path="app/routes/feed.py">
+# app/routes/feed.py
+from __future__ import annotations
+
+import os
+import re
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Dict, Any
+from uuid import UUID
+
+import requests
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+
+UTC = timezone.utc
+router = APIRouter(prefix="/api", tags=["feed"])
+
+# openai test
+@router.get("/feed/selftest")
+def feed_selftest():
+    try:
+        from openai import OpenAI
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return {"ok": False, "reason": "missing OPENAI_API_KEY"}
+        client = OpenAI(api_key=api_key)
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        r = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Reply with a single short sentence."},
+                {"role": "user", "content": "Say hello from Loop API."}
+            ],
+            max_completion_tokens=20,
+            temperature=0
+        )
+        return {"ok": True, "engine": "openai", "sample": r.choices[0].message.content.strip()}
+    except Exception as e:
+        return {"ok": False, "reason": "openai_exception", "detail": str(e)[:300]}
+
+# ----------------------------
+# Supabase helpers
+# ----------------------------
+def get_env():
+    base = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not base or not key:
+        raise HTTPException(status_code=500, detail="Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+    return base, key
+
+def _h(key: str, prefer: Optional[str] = None) -> Dict[str, str]:
+    h = {"apikey": key, "Authorization": f"Bearer {key}"}
+    if prefer:
+        h["Prefer"] = prefer
+    return h
+
+def supa_select(base: str, key: str, path: str, params: Dict[str, str]) -> List[dict]:
+    r = requests.get(f"{base}/rest/v1/{path}", params=params, headers=_h(key))
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Supabase select failed: {r.text}")
+    return r.json()
+
+def supa_single(base: str, key: str, path: str, params: Dict[str, str]) -> Optional[dict]:
+    rows = supa_select(base, key, path, params)
+    return rows[0] if rows else None
+
+def supa_upsert(base: str, key: str, path: str, json_body: dict) -> dict:
+    # Use 'resolution=merge-duplicates' to upsert on PK/unique constraint
+    r = requests.post(
+        f"{base}/rest/v1/{path}",
+        json=[json_body],
+        headers=_h(key, "return=representation,resolution=merge-duplicates"),
+    )
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Supabase upsert failed: {r.text}")
+    rows = r.json()
+    return rows[0] if isinstance(rows, list) and rows else {}
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def ensure_dt(x: Any) -> datetime:
+    if x is None:
+        return datetime.fromtimestamp(0, tz=UTC)
+    if isinstance(x, datetime):
+        return x if x.tzinfo else x.replace(tzinfo=UTC)
+    try:
+        dt = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+    except Exception:
+        return datetime.fromtimestamp(0, tz=UTC)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+def _clean_messages_for_summary(texts: List[str], per_msg_cap: int = 240) -> List[str]:
+    cleaned: List[str] = []
+    seen = set()
+    url_re = re.compile(r"https?://\S+")
+    ws_re = re.compile(r"\s+")
+    for t in texts:
+        if not t:
+            continue
+        t = url_re.sub("", t)
+        t = ws_re.sub(" ", t).strip()
+        if len(t) > per_msg_cap:
+            t = t[:per_msg_cap].rstrip() + "…"
+        if len(t) < 2:
+            continue
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(t)
+    return cleaned[:200]
+
+def summarise_messages(loop_name: str, requester_handle: str, messages: List[str]) -> tuple[str, str]:
+    """
+    Returns (summary_text, engine), engine is 'openai' or 'fallback'.
+    """
+    def simple() -> tuple[str, str]:
+        joined = " ".join(messages)
+        return ((joined or "No new updates.")[:500], "fallback")
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return simple()
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+        # Bound context size even if many messages slip through
+        N, M = 30, 10
+        msgs = messages if len(messages) <= (N + M) else (messages[:N] + messages[-M:])
+
+        system = (
+            "You are the loop bot for a private group. "
+            "Write a concise shared update in neutral EN-GB, max 3 sentences. "
+            "Third-person; no quotes; no speculation."
+        )
+        user = (
+            f"Loop name: {loop_name}\n"
+            f"Requester (exclude their posts): @{requester_handle}\n"
+            "Posts to summarise:\n- " + "\n- ".join(msgs)
+        )
+
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_completion_tokens=220,
+        )
+        text = resp.choices[0].message.content.strip()
+        return (text, "openai")
+    except Exception:
+        return simple()
+
+# ----------------------------
+# Response model
+# ----------------------------
+class FeedDigest(BaseModel):
+    loop_id: UUID
+    for_profile_id: UUID
+    items_count: int
+    window_start: Optional[datetime] = None
+    window_end: Optional[datetime] = None
+    digest_text: str
+    last_seen_at_prev: Optional[datetime] = None
+    last_seen_at_new: Optional[datetime] = None
+    engine: Optional[str] = None
+
+# ----------------------------
+# Route
+# ----------------------------
+@router.get("/feed", response_model=FeedDigest)
+def get_feed(
+    loop_id: UUID = Query(...),
+    for_profile_id: UUID = Query(...),
+    since: Optional[str] = Query(None),
+    preview: bool = Query(False),
+    last_seen_hours: int = Query(48, ge=1, le=24 * 30),  # default rolling window: 48h
+    max_messages: int = Query(50, ge=1, le=200),        # cap number of inputs to summariser
+    include_self: bool = Query(False),
+):
+    base, key = get_env()
+
+    # 1) Loop and requester
+    loop_row = supa_single(base, key, "loops", {"select": "id,name,created_at", "id": f"eq.{loop_id}"})
+    loop_name = (loop_row or {}).get("name") or str(loop_id)
+    requester = supa_single(base, key, "profiles", {"select": "id,handle", "id": f"eq.{for_profile_id}"})
+    requester_handle = (requester or {}).get("handle") or str(for_profile_id)
+
+    # 2) Determine lower bound (pointer or rolling window)
+    read_state = supa_single(
+        base, key, "loop_read_state",
+        {"select": "loop_id,profile_id,last_seen_at", "loop_id": f"eq.{loop_id}", "profile_id": f"eq.{for_profile_id}"}
+    )
+    if since:
+        last_seen_at_prev = ensure_dt(since)
+    else:
+        if not read_state or preview:
+            last_seen_at_prev = datetime.now(tz=UTC) - timedelta(hours=last_seen_hours)
+        else:
+            last_seen_at_prev = ensure_dt(read_state.get("last_seen_at")) if read_state else datetime.fromtimestamp(0, tz=UTC)
+
+    # 3) Fetch messages newer than window start, from this loop
+    params: Dict[str, str] = {
+        "select": "id,created_at,content_ciphertext,created_by,threads!inner(id,loop_id)",
+        "created_at": f"gt.{last_seen_at_prev.isoformat()}",
+        "order": "created_at.asc",
+        "threads.loop_id": f"eq.{loop_id}",
+    }
+    if not include_self:
+        params["created_by"] = f"neq.{for_profile_id}"
+
+    rows = supa_select(base, key, "messages", params)
+
+    # Optional recency cap (e.g., last 7 days) and hard cap
+    cutoff = datetime.now(tz=UTC) - timedelta(days=7)
+    rows = [r for r in rows if ensure_dt(r.get("created_at")) >= cutoff]
+    if rows:
+        rows = rows[-max_messages:]
+
+    if not rows:
+        return FeedDigest(
+            loop_id=loop_id,
+            for_profile_id=for_profile_id,
+            items_count=0,
+            digest_text="No new updates.",
+            last_seen_at_prev=last_seen_at_prev,
+            last_seen_at_new=last_seen_at_prev,
+            engine="fallback",
+        )
+
+    def decode(c: Optional[str]) -> str:
+        if not c:
+            return ""
+        return c[7:].strip() if c.startswith("cipher:") else c
+
+    texts = [decode(r.get("content_ciphertext")) for r in rows if r.get("content_ciphertext")]
+    texts = _clean_messages_for_summary(texts)
+
+    created_ats = [ensure_dt(r.get("created_at")) for r in rows]
+    window_start, window_end = min(created_ats), max(created_ats)
+
+    digest_text, engine = summarise_messages(loop_name, requester_handle, texts)
+
+    # 4) Advance pointer if not preview
+    last_seen_at_new = last_seen_at_prev
+    if not preview:
+        supa_upsert(base, key, "loop_read_state", {
+            "loop_id": str(loop_id),
+            "profile_id": str(for_profile_id),
+            "last_seen_at": window_end.isoformat(),
+        })
+        last_seen_at_new = window_end
+
+    return FeedDigest(
+        loop_id=loop_id,
+        for_profile_id=for_profile_id,
+        items_count=len(rows),
+        window_start=window_start,
+        window_end=window_end,
+        digest_text=digest_text,
+        last_seen_at_prev=last_seen_at_prev,
+        last_seen_at_new=last_seen_at_new,
+        engine=engine,
+    )
+</file>
+
+<file path="app/routes/messages.py">
+# app/routes/messages.py
+from __future__ import annotations
+
+import uuid
+from typing import List, Optional, Dict, Any
+
+from fastapi import APIRouter, HTTPException, Query, Body
+from pydantic import BaseModel, Field
+
+from app.db import get_conn  # psycopg connection factory
+from app.crypto import seal_plaintext  # returns "cipher:<text>" per handbook
+
+router = APIRouter(prefix="/api", tags=["website-facade"])
+
+INBOX_TO_BOT = "inbox_to_bot"
+BOT_TO_USER = "bot_to_user"
+
+
+# ----------------------------- Models ---------------------------------------
+
+class SendMessagePayload(BaseModel):
+    thread_id: str = Field(..., description="UUID of the thread")
+    user_id: str = Field(..., description="Profile UUID of the human sender")
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
+class MessageOut(BaseModel):
+    id: str
+    thread_id: str
+    created_at: str
+    created_by: str
+    author_member_id: Optional[str] = None
+    audience: str
+    recipient_profile_id: Optional[str] = None
+    content: str  # plaintext (cipher shim removed)
+
+
+class GetMessagesResponse(BaseModel):
+    ok: bool = True
+    items: List[MessageOut] = []
+
+
+# --------------------------- Helpers ----------------------------------------
+
+def _strip_cipher(cipher_text: Optional[str]) -> str:
+    """
+    Remove the 'cipher:' shim prefix. Returns empty string on None.
+    """
+    if not cipher_text:
+        return ""
+    if cipher_text.startswith("cipher:"):
+        return cipher_text[len("cipher:") :].strip()
+    return cipher_text.strip()
+
+
+def _thread_exists_and_loop_id(conn, thread_id: str) -> str:
+    with conn.cursor() as cur:
+        cur.execute("select loop_id from threads where id = %s", (uuid.UUID(thread_id),))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        (loop_id,) = row
+        return str(loop_id)
+
+
+def _author_member_id(conn, *, loop_id: str, profile_id: str) -> str:
+    """
+    Resolve loop_members.id for (loop_id, profile_id).
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "select id from loop_members where loop_id = %s and profile_id = %s",
+            (uuid.UUID(loop_id), uuid.UUID(profile_id)),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Sender is not a member of this loop",
+            )
+        (member_id,) = row
+        return str(member_id)
+
+
+def _row_to_message_out(row: Dict[str, Any]) -> MessageOut:
+    return MessageOut(
+        id=str(row["id"]),
+        thread_id=str(row["thread_id"]),
+        created_at=row["created_at"].isoformat(),
+        created_by=str(row["created_by"]) if row["created_by"] else "",
+        author_member_id=str(row["author_member_id"]) if row["author_member_id"] else None,
+        audience=row["audience"],
+        recipient_profile_id=str(row["recipient_profile_id"]) if row["recipient_profile_id"] else None,
+        content=_strip_cipher(row["content_ciphertext"]),
+    )
+
+
+# ---------------------------- Routes ----------------------------------------
+
+@router.post("/send_message", response_model=MessageOut)
+def send_message(payload: SendMessagePayload = Body(...)):
+    """
+    Insert a human -> bot message in the given thread.
+
+    Behaviour:
+    - Validates thread and membership.
+    - Inserts a row into messages with audience='inbox_to_bot'.
+    - Returns the inserted row (plaintext content).
+    """
+    try:
+        thread_uuid = str(uuid.UUID(payload.thread_id))
+        user_uuid = str(uuid.UUID(payload.user_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID in thread_id or user_id")
+
+    with get_conn() as conn:
+        conn.autocommit = False
+        try:
+            loop_id = _thread_exists_and_loop_id(conn, thread_uuid)
+            author_member_id = _author_member_id(conn, loop_id=loop_id, profile_id=user_uuid)
+
+            sealed = seal_plaintext(payload.content)
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into messages
+                        (thread_id, created_by, author_member_id, audience, recipient_profile_id,
+                         content_ciphertext, created_at)
+                    values
+                        (%s, %s, %s, %s, %s, %s, now() at time zone 'utc')
+                    returning id, thread_id, created_at, created_by, author_member_id,
+                              audience, recipient_profile_id, content_ciphertext
+                    """,
+                    (
+                        uuid.UUID(thread_uuid),
+                        uuid.UUID(user_uuid),
+                        uuid.UUID(author_member_id),
+                        INBOX_TO_BOT,
+                        None,  # no recipient for human->bot
+                        sealed,
+                    ),
+                )
+                (
+                    mid,
+                    t_id,
+                    created_at,
+                    created_by,
+                    author_member_id_row,
+                    audience,
+                    recipient_profile_id,
+                    content_ciphertext,
+                ) = cur.fetchone()
+
+            conn.commit()
+
+            return MessageOut(
+                id=str(mid),
+                thread_id=str(t_id),
+                created_at=created_at.isoformat(),
+                created_by=str(created_by),
+                author_member_id=str(author_member_id_row) if author_member_id_row else None,
+                audience=audience,
+                recipient_profile_id=None,
+                content=_strip_cipher(content_ciphertext),
+            )
+        except Exception:
+            conn.rollback()
+            raise
+
+
+@router.get("/get_messages", response_model=GetMessagesResponse)
+def get_messages(
+    thread_id: str = Query(..., description="Thread UUID"),
+    user_id: str = Query(..., description="Profile UUID of the viewer whose DM stream we are showing"),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """
+    Return a merged chronological stream for the viewer:
+
+    - Human->Bot rows authored by this viewer (their own sent messages), AND
+    - Bot->User rows targeted at this viewer (bot's DMs to them).
+
+    This allows the frontend to render:
+      - A or B (viewer’s human posts)      -> audience='inbox_to_bot'
+      - Bot→Viewer (personalised bot rows) -> audience='bot_to_user' AND recipient_profile_id=user_id
+
+    Response items include `audience` and `recipient_profile_id` so the UI can
+    split panes for A, B, Bot→A, Bot→B if needed.
+    """
+    try:
+        thread_uuid = uuid.UUID(thread_id)
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID in thread_id or user_id")
+
+    with get_conn() as conn:
+        # Validate the thread exists (and implicitly that it belongs to some loop)
+        _ = _thread_exists_and_loop_id(conn, str(thread_uuid))
+
+        with conn.cursor() as cur:
+            # We select both sets and UNION ALL with ordering by created_at asc
+            cur.execute(
+                """
+                select id, thread_id, created_at, created_by, author_member_id,
+                       audience, recipient_profile_id, content_ciphertext
+                from (
+                    -- Viewer’s own human->bot posts
+                    select m.id, m.thread_id, m.created_at, m.created_by, m.author_member_id,
+                           m.audience, m.recipient_profile_id, m.content_ciphertext
+                    from messages m
+                    where m.thread_id = %s
+                      and m.audience = %s
+                      and m.created_by = %s
+
+                    union all
+
+                    -- Bot’s per-recipient DMs to the viewer
+                    select m2.id, m2.thread_id, m2.created_at, m2.created_by, m2.author_member_id,
+                           m2.audience, m2.recipient_profile_id, m2.content_ciphertext
+                    from messages m2
+                    where m2.thread_id = %s
+                      and m2.audience = %s
+                      and m2.recipient_profile_id = %s
+                ) x
+                order by created_at asc
+                limit %s
+                """,
+                (
+                    thread_uuid,
+                    INBOX_TO_BOT,
+                    user_uuid,
+                    thread_uuid,
+                    BOT_TO_USER,
+                    user_uuid,
+                    limit,
+                ),
+            )
+            rows = cur.fetchall()
+
+        cols = [
+            "id",
+            "thread_id",
+            "created_at",
+            "created_by",
+            "author_member_id",
+            "audience",
+            "recipient_profile_id",
+            "content_ciphertext",
+        ]
+        items = [_row_to_message_out(dict(zip(cols, r))) for r in rows]
+
+        return GetMessagesResponse(ok=True, items=items)
+</file>
+
+<file path="app/services/recipients.py">
+# app/services/recipients.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable, List, Mapping, Optional
+
+import psycopg  # psycopg 3.x sync client
+
+
+@dataclass(frozen=True)
+class MessageKey:
+    """Identifies a source human message we want to respond to."""
+    message_id: str
+    author_profile_id: str
+    author_member_id: str
+
+
+def _fetch_loop_id_for_member(conn: psycopg.Connection, author_member_id: str) -> Optional[str]:
+    """
+    Resolve loop_id from a member id.
+    Schema per your DB:
+      members(id UUID PK, loop_id UUID, profile_id UUID, role TEXT)
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT loop_id
+            FROM members
+            WHERE id = %s
+            """,
+            (author_member_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def _fetch_recipients_for_loop(
+    conn: psycopg.Connection,
+    loop_id: str,
+    exclude_profile_ids: Iterable[str],
+) -> List[str]:
+    """
+    Compute intended recipients for a loop:
+      recipients = all members in loop
+                   MINUS {author, any known bots/system accounts}
+
+    Since there’s no is_human flag in your schema, we filter by a blocklist of known bot/system IDs.
+    """
+    exclude = tuple(set(exclude_profile_ids))
+    with conn.cursor() as cur:
+        if exclude:
+            # Parameter placeholders need to be expanded dynamically
+            placeholders = ", ".join(["%s"] * len(exclude))
+            cur.execute(
+                f"""
+                SELECT m.profile_id
+                FROM members m
+                WHERE m.loop_id = %s
+                  AND m.profile_id NOT IN ({placeholders})
+                """,
+                (loop_id, *exclude),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT m.profile_id
+                FROM members m
+                WHERE m.loop_id = %s
+                """,
+                (loop_id,),
+            )
+        return [r[0] for r in cur.fetchall()]
+
+
+def resolve_recipients_for_message(
+    conn: psycopg.Connection,
+    *,
+    author_member_id: str,
+    author_profile_id: str,
+    known_bot_profile_ids: Iterable[str],
+) -> List[str]:
+    """
+    Resolve recipients for ONE human message using canonical logic:
+
+      loop_id := SELECT loop_id FROM members WHERE id = author_member_id
+      recipients := SELECT profile_id FROM members WHERE loop_id = loop_id
+                    EXCEPT {author_profile_id} ∪ {known_bot_profile_ids}
+
+    Returns a list of profile_id (strings). Empty list means no targets.
+    """
+    loop_id = _fetch_loop_id_for_member(conn, author_member_id)
+    if not loop_id:
+        return []
+
+    exclude = set(known_bot_profile_ids or [])
+    exclude.add(author_profile_id)
+
+    return _fetch_recipients_for_loop(conn, loop_id, exclude_profile_ids=exclude)
+
+
+def resolve_recipients_batched(
+    conn: psycopg.Connection,
+    *,
+    messages: Iterable[MessageKey],
+    known_bot_profile_ids: Iterable[str],
+) -> Mapping[str, List[str]]:
+    """
+    Batched variant:
+      Input: iterable of MessageKey
+      Output: dict[message_id] -> list[recipient_profile_id]
+
+    This reduces round-trips by prefetching loop_ids and then recipients per loop once,
+    and reusing the results for messages within the same loop.
+    """
+    msgs = list(messages)
+    if not msgs:
+        return {}
+
+    # 1) Prefetch loop_id per author_member_id
+    author_member_ids = tuple(m.author_member_id for m in msgs)
+    loop_by_member: dict[str, str] = {}
+
+    with conn.cursor() as cur:
+        placeholders = ", ".join(["%s"] * len(author_member_ids))
+        cur.execute(
+            f"""
+            SELECT id AS author_member_id, loop_id
+            FROM members
+            WHERE id IN ({placeholders})
+            """,
+            author_member_ids,
+        )
+        for row in cur.fetchall():
+            loop_by_member[row[0]] = row[1]
+
+    # 2) Group messages by loop_id
+    by_loop: dict[str, List[MessageKey]] = {}
+    for m in msgs:
+        loop_id = loop_by_member.get(m.author_member_id)
+        if not loop_id:
+            continue
+        by_loop.setdefault(loop_id, []).append(m)
+
+    # 3) For each loop, fetch recipients once with the union exclude set
+    bot_set = set(known_bot_profile_ids or [])
+    recipients_by_loop: dict[str, List[str]] = {}
+    for loop_id, group in by_loop.items():
+        exclude = {m.author_profile_id for m in group} | bot_set
+        recipients_by_loop[loop_id] = _fetch_recipients_for_loop(conn, loop_id, exclude)
+
+    # 4) Map back per message_id (same loop recipients, but still exclude that message’s author)
+    out: dict[str, List[str]] = {}
+    for m in msgs:
+        loop_id = loop_by_member.get(m.author_member_id)
+        if not loop_id:
+            out[m.message_id] = []
+            continue
+        base = recipients_by_loop.get(loop_id, [])
+        if not base:
+            out[m.message_id] = []
+            continue
+        # base already excludes all authors in the group; still guard locally
+        out[m.message_id] = [pid for pid in base if pid != m.author_profile_id]
+    return out
+</file>
+
+<file path="app/__init__.py">
+# intentionally empty
+</file>
+
+<file path="app/bot.py">
+# app/bot.py
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import os
+import psycopg  # psycopg 3.x
+from psycopg.rows import dict_row
+from fastapi import APIRouter, Header, HTTPException, Query
+from pydantic import BaseModel
+
+from app.llm import generate_reply
+
+# --------------------------------------------------------------------------------------
+# If you have an LLM helper already, import it and swap into generate_reply().
+# For now we keep the same "FYI." behavior you saw in your feeds/smoke tests.
+# --------------------------------------------------------------------------------------
+def generate_reply(human_text: str, author_profile_id: str, recipient_profile_id: str, thread_id: str) -> str:
+    return "FYI."
+
+router = APIRouter(prefix="/api", tags=["bot"])  # => /api/bot/process
+
+# ----------------------------------- DB utils ----------------------------------------
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _get_conn() -> psycopg.Connection:
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL (or SUPABASE_DB_URL) is not set")
+    # row_factory=dict_row gives dict-like rows: row["col"]
+    return psycopg.connect(dsn, row_factory=dict_row)
+
+# ----------------------------------- Queries -----------------------------------------
+
+def _select_unprocessed(conn: psycopg.Connection, thread_id: Optional[str], limit: int) -> List[Dict[str, Any]]:
+    """
+    Select human messages awaiting processing:
+      audience='inbox_to_bot' AND COALESCE(processed,false)=false
+    Ordered oldest first to maintain causal order.
+    """
+    base = """
+      SELECT id, thread_id, created_at, created_by, author_member_id
+      FROM messages
+      WHERE audience='inbox_to_bot'
+        AND COALESCE(processed,FALSE)=FALSE
+    """
+    args: List[Any] = []
+    if thread_id:
+        base += " AND thread_id=%s"
+        args.append(thread_id)
+    base += " ORDER BY created_at ASC LIMIT %s"
+    args.append(limit)
+
+    with conn.cursor() as cur:
+        cur.execute(base, tuple(args))
+        return list(cur.fetchall())
+
+def _loop_id_for_member(conn: psycopg.Connection, author_member_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT loop_id FROM members WHERE id=%s", (author_member_id,))
+        row = cur.fetchone()
+        return row["loop_id"] if row else None
+
+def _bot_member_id_for_loop(conn: psycopg.Connection, loop_id: str, bot_profile_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM members WHERE loop_id=%s AND profile_id=%s",
+            (loop_id, bot_profile_id),
+        )
+        row = cur.fetchone()
+        return row["id"] if row else None
+
+def _recipients_for_loop(conn: psycopg.Connection, loop_id: str, exclude_ids: List[str]) -> List[str]:
+    """
+    Recipients = all profile_ids in loop MINUS {author_profile_id, bot_profile_id}.
+    """
+    if exclude_ids:
+        ph = ", ".join(["%s"] * len(exclude_ids))
+        q = f"SELECT profile_id FROM members WHERE loop_id=%s AND profile_id NOT IN ({ph})"
+        args = (loop_id, *exclude_ids)
+    else:
+        q = "SELECT profile_id FROM members WHERE loop_id=%s"
+        args = (loop_id,)
+    with conn.cursor() as cur:
+        cur.execute(q, args)
+        return [r["profile_id"] for r in cur.fetchall()]
+
+def _insert_and_mark(
+    conn: psycopg.Connection,
+    *,
+    bot_profile_id: str,
+    rows_to_publish: List[Dict[str, Any]],
+    source_ids: List[str],
+) -> Tuple[int, int]:
+    """
+    Insert bot_to_user messages that satisfy NOT NULL columns and then mark sources processed.
+    rows_to_publish expects per-row:
+      thread_id, created_at, author_member_id (bot's), recipient_profile_id, content_ciphertext
+    Returns (inserted_count, processed_count).
+    """
+    inserted = processed = 0
+    with conn.cursor() as cur:
+        if rows_to_publish:
+            values_sql = ", ".join(["(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"] * len(rows_to_publish))
+            args: List[Any] = []
+            for r in rows_to_publish:
+                args.extend([
+                    r["thread_id"],           # thread_id
+                    r["created_at"],          # created_at
+                    bot_profile_id,           # created_by
+                    r["bot_member_id"],       # author_member_id (bot's membership in that loop)
+                    "bot",                    # role
+                    "outbox",                 # channel
+                    "private",                # visibility
+                    "bot_to_user",            # audience
+                    r["recipient_profile_id"],
+                    r["content_ciphertext"],  # storing plaintext here until encryptor is wired
+                ])
+            cur.execute(
+                f"""
+                INSERT INTO messages
+                  (thread_id, created_at, created_by, author_member_id,
+                   role, channel, visibility, audience, recipient_profile_id, content_ciphertext)
+                VALUES {values_sql}
+                """,
+                args,
+            )
+            inserted = cur.rowcount
+
+        if source_ids:
+            ph = ", ".join(["%s"] * len(source_ids))
+            cur.execute(
+                f"UPDATE messages SET processed=TRUE, processed_at=NOW() WHERE id IN ({ph})",
+                source_ids,
+            )
+            processed = cur.rowcount
+
+    return inserted, processed
+
+# ----------------------------- Response Models (stable shape) -------------------------
+
+class Preview(BaseModel):
+    recipient_profile_id: str
+    content: str
+
+class Item(BaseModel):
+    human_message_id: str
+    thread_id: str
+    recipients: List[str]
+    bot_rows: List[Dict[str, Any]] = []  # kept for shape compatibility
+    previews: List[Preview] = []
+    skipped_reason: Optional[str] = None
+
+class Stats(BaseModel):
+    scanned: int
+    processed: int
+    inserted: int
+    skipped: int
+    dry_run: bool
+
+class ProcessResponse(BaseModel):
+    ok: bool
+    reason: Optional[str]
+    stats: Stats
+    items: List[Item]
+
+# ------------------------------------ Route ------------------------------------------
+
+@router.post("/bot/process", response_model=ProcessResponse)
+def process(
+    thread_id: Optional[str] = Query(default=None, description="Conversation/thread id"),
+    limit: int = Query(default=10, ge=1, le=100),
+    dry_run: bool = Query(default=True),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),  # bot profile id
+):
+    """
+    Process human inbox_to_bot messages into bot_to_user messages.
+
+    Fixes:
+      - Only select COALESCE(processed,false)=false
+      - Derive loop_id via author_member_id -> members.loop_id
+      - Compute recipients from members(loop_id) minus {author, bot}
+      - Insert rows satisfying NOT NULLs (incl. author_member_id + content_ciphertext)
+      - Mark sources processed (only when dry_run=false)
+    """
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="missing_bot_profile_id_header")
+
+    scanned = processed = inserted = skipped = 0
+    items: List[Item] = []
+
+    try:
+        with _get_conn() as conn:
+            # 1) pull work
+            rows = _select_unprocessed(conn, thread_id, limit)
+            scanned = len(rows)
+            if not rows:
+                return ProcessResponse(
+                    ok=True, reason=None,
+                    stats=Stats(scanned=scanned, processed=0, inserted=0, skipped=0, dry_run=dry_run),
+                    items=[],
+                )
+
+            to_publish: List[Dict[str, Any]] = []
+            source_ids: List[str] = []
+
+            # 2) per message: resolve loop, bot membership, recipients; build previews/publish rows
+            for r in rows:
+                msg_id = r["id"]
+                thread = r["thread_id"]
+                author_profile_id = r["created_by"]
+                author_member_id = r["author_member_id"]
+
+                recipients: List[str] = []
+                previews: List[Preview] = []
+                skipped_reason: Optional[str] = None
+
+                try:
+                    if not author_member_id:
+                        skipped += 1
+                        skipped_reason = "missing author_member_id"
+                    else:
+                        loop_id = _loop_id_for_member(conn, author_member_id)
+                        if not loop_id:
+                            skipped += 1
+                            skipped_reason = "missing loop_id"
+                        else:
+                            bot_member_id = _bot_member_id_for_loop(conn, loop_id, x_user_id)
+                            if not bot_member_id:
+                                skipped += 1
+                                skipped_reason = "bot not a member of loop"
+                            else:
+                                # Exclude author and bot
+                                recipients = _recipients_for_loop(conn, loop_id, exclude_ids=[author_profile_id, x_user_id])
+
+                                # Build previews (publish only writes; dry_run only previews)
+                                for pid in recipients:
+                                    txt = generate_reply("", author_profile_id, pid, thread)
+                                    previews.append(Preview(recipient_profile_id=pid, content=txt))
+                                    if not dry_run:
+                                        to_publish.append(
+                                            {
+                                                "thread_id": thread,
+                                                "created_at": _now_iso(),
+                                                "bot_member_id": bot_member_id,        # REQUIRED (NOT NULL author_member_id)
+                                                "recipient_profile_id": pid,
+                                                "content_ciphertext": txt,             # store plaintext for now
+                                            }
+                                        )
+
+                                if not dry_run:
+                                    source_ids.append(msg_id)
+
+                except Exception as e:
+                    skipped += 1
+                    skipped_reason = f"error: {e}"
+
+                items.append(
+                    Item(
+                        human_message_id=msg_id,
+                        thread_id=thread,
+                        recipients=recipients,
+                        previews=previews if dry_run else [],
+                        bot_rows=[],  # keep shape compatibility
+                        skipped_reason=skipped_reason,
+                    )
+                )
+
+            # 3) publish (insert + mark processed) atomically
+            if not dry_run and (to_publish or source_ids):
+                with _get_conn() as conn2, conn2.transaction():
+                    ins, proc = _insert_and_mark(
+                        conn2,
+                        bot_profile_id=x_user_id,
+                        rows_to_publish=to_publish,
+                        source_ids=source_ids,
+                    )
+                    inserted += ins
+                    processed += proc
+
+        return ProcessResponse(
+            ok=True,
+            reason=None,
+            stats=Stats(scanned=scanned, processed=processed, inserted=inserted, skipped=skipped, dry_run=dry_run),
+            items=items,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        return ProcessResponse(
+            ok=False,
+            reason=str(e),
+            stats=Stats(scanned=scanned, processed=processed, inserted=inserted, skipped=skipped, dry_run=dry_run),
+            items=items,
+        )
+</file>
+
+<file path="app/crypto.py">
+# app/crypto.py
+"""
+Placeholder crypto shim used across the app.
+
+Current behaviour:
+- "Encrypt" = prefix with "cipher:" so we never store raw text by accident.
+- "Decrypt" = strip the prefix back to plaintext for APIs that must return text.
+
+Notes:
+- This is intentionally trivial. See the handbook §13.4 for migrating to real AEAD.
+- Keep function names stable; other modules import `seal_plaintext`.
+"""
+
+from __future__ import annotations
+
+
+_PREFIX = "cipher:"
+
+
+def seal_plaintext(plaintext: str) -> str:
+    """
+    Returns a ciphertext placeholder by prefixing with 'cipher:'.
+    Ensures input is a string and strips leading/trailing whitespace.
+    """
+    if plaintext is None:
+        plaintext = ""
+    # Normalise to str and trim outer whitespace only (preserve inner spaces/newlines)
+    text = str(plaintext).strip()
+    return f"{_PREFIX}{text}"
+
+
+def reveal_plaintext(ciphertext: str) -> str:
+    """
+    Strips the 'cipher:' prefix and returns the original plaintext.
+    If the prefix is missing, returns the input as-is.
+    """
+    if not isinstance(ciphertext, str):
+        return ""
+    if ciphertext.startswith(_PREFIX):
+        return ciphertext[len(_PREFIX) :].strip()
+    return ciphertext.strip()
+
+
+__all__ = ["seal_plaintext", "reveal_plaintext"]
+</file>
+
+<file path="app/db.py">
+# app/db.py
+from __future__ import annotations
+
+import os
+from contextlib import contextmanager
+from typing import Iterator, Optional
+from urllib.parse import urlparse
+
+import psycopg
+from psycopg import Connection
+
+_DATABASE_URL: Optional[str] = os.getenv("DATABASE_URL")
+
+def _normalize_dsn(raw: str) -> str:
+    if not raw:
+        raise RuntimeError("DATABASE_URL is not configured")
+    # Must be postgres/postgresql, NOT https
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("postgres", "postgresql"):
+        raise RuntimeError(
+            f"Invalid DATABASE_URL scheme '{parsed.scheme}'. "
+            "Use the Postgres connection string (not the HTTP Supabase URL)."
+        )
+    dsn = raw
+    if "sslmode=" not in dsn and parsed.scheme in ("postgres", "postgresql"):
+        sep = "&" if "?" in dsn else "?"
+        dsn = f"{dsn}{sep}sslmode=require"
+    return dsn
+
+@contextmanager
+def get_conn(*, autocommit: bool = False) -> Iterator[Connection]:
+    dsn = _normalize_dsn(_DATABASE_URL or "")
+    conn = psycopg.connect(dsn, autocommit=autocommit)  # tuple rows
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+__all__ = ["get_conn"]
+</file>
+
+<file path="app/diagnostics.py">
+# app/diagnostics.py
+from fastapi import APIRouter
+import os
+import psycopg
+from psycopg.rows import dict_row
+
+router = APIRouter(prefix="/api", tags=["diagnostics"])
+
+def _get_conn():
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL")
+    return psycopg.connect(dsn, row_factory=dict_row)
+
+@router.get("/whoami")
+def whoami():
+    db_user = session_user = None
+    try:
+        with _get_conn() as conn, conn.cursor() as cur:
+            cur.execute("select current_user as u, session_user as s")
+            row = cur.fetchone()
+            if row:
+                db_user = row["u"]
+                session_user = row["s"]
+    except Exception as e:
+        return {"ok": False, "error": str(e), "db_user": db_user, "session_user": session_user}
+
+    return {
+        "ok": True,
+        "build_id": os.getenv("BUILD_ID", "unknown"),
+        "db_user": db_user,
+        "session_user": session_user,
+        "module": __name__,
+    }
+</file>
+
+<file path="app/llm.py">
+# app/llm.py
+from __future__ import annotations
+
+import os
+import time
+from typing import Optional, List, Dict, Any, Tuple
+
+from openai import OpenAI
+
+# ── Env knobs ──────────────────────────────────────────────────────────────────
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+
+# Completion controls
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "256"))  # kept var name for env b/w compat
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+LLM_TOP_P = float(os.getenv("LLM_TOP_P", "1.0"))
+
+# Timeouts & retries
+LLM_TIMEOUT_SEC = int(os.getenv("LLM_TIMEOUT_SEC", "45"))
+LLM_RETRIES = int(os.getenv("LLM_RETRIES", "2"))  # default up to 2 retries (3 total attempts)
+LLM_RETRY_MAX_S = int(os.getenv("LLM_RETRY_MAX_SEC", "10"))
+
+# Output guardrail (post-trim)
+LLM_MAX_CHARS = int(os.getenv("LLM_MAX_CHARS", "600"))
+
+# Diagnostics
+LLM_LOG_USAGE = os.getenv("LLM_LOG_USAGE", "0") == "1"
+
+# ── Client init (single global) ────────────────────────────────────────────────
+_client: Optional[OpenAI] = None
+if OPENAI_API_KEY:
+    _client = OpenAI(api_key=OPENAI_API_KEY, timeout=LLM_TIMEOUT_SEC)
+
+
+# ── Prompt: Loop Relay Composer (third-person digest with AIOK) ────────────────
+SYSTEM_PROMPT = """You synthesize short messages from multiple authors in a shared loop into one concise, third-person update tailored for a specific recipient.
+
+ROLE & PURPOSE
+- Convert first-person statements into neutral third-person sentences with clear attribution to each author (e.g., “User A…”, “User C…”).
+- Output should be glanceable and practical.
+
+AUDIENCE
+- One recipient (the reader). Do not address them as “you”. No pleasantries or filler.
+
+STYLE
+- Third person, neutral, matter-of-fact.
+- Prefer 1 tight sentence; allow up to 2 sentences total and ~40–50 words maximum.
+- Combine related items into a single flowing sentence; use a semicolon if needed.
+- No commands, apologies, or speculation.
+
+ATTRIBUTION & CONTENT RULES
+- Attribute each item to its author label (e.g., “User A”, “Alice” if provided).
+- Transform first-person to third-person (“I had a fun time…” → “User A enjoyed…”).
+- Preserve intent: info / question / request / invite (e.g., “User C is asking whether…”, “User C invites others to…”).
+- De-duplicate overlaps; include each author at most once unless essential.
+- Do not add facts beyond the provided content. If details are missing, omit them.
+
+TIME & DATE HANDLING
+- You are given CURRENT_DATE, CURRENT_TIME, and TIMEZONE context.
+- When an item references a relative time (e.g., “next Sunday”), keep the human phrase and append a normalized explicit date in parentheses using the given timezone, e.g., “next Sunday (26 October 2025)”.
+- Use correct tense for past vs. future.
+
+NO-UPDATE BEHAVIOUR
+- If there are no new or relevant messages to summarise, output exactly:
+  No new updates in this loop since you last refreshed at {CURRENT_TIME} on {CURRENT_DATE}.-AIOK
+- Use 24-hour time format (HH:MM). Do not add quotes or extra text.
+
+STAMPING RULE (DIAGNOSTIC)
+- At the end of every valid summary you generate, append the literal string “-AIOK”. Do not add spaces, punctuation, or any other text after it.
+- Never produce the stamp unless you are producing an actual summary or the explicit no-update line above.
+
+OUTPUT FORMAT
+- Single paragraph. No heading, bullets, or labels.
+
+EXAMPLE (for style illustration; adapt names/dates based on inputs)
+INPUT MESSAGES (2):
+  - Author: User A — “I had a fun time at the lake last week with the kids.”
+  - Author: User C — “Does anyone want to join me at the market next Sunday?”
+CURRENT_DATE: 20 October 2025
+CURRENT_TIME: 14:32
+TIMEZONE: Asia/Singapore
+
+EXPECTED OUTPUT:
+User A enjoyed time at the lake with the kids last week; User C is asking if anyone wants to join them at the market next Sunday (26 October 2025).-AIOK
+"""
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def _build_user_prompt(
+    context_messages: Optional[List[Dict[str, str]]] = None,
+    message_text: str = "",
+    current_date: str = "",
+    current_time: str = "",
+    timezone: str = "Asia/Singapore",
+) -> List[Dict[str, str]]:
+    """
+    Builds the chat payload. Supports:
+    - context_messages: list of {"author": "...", "text": "..."} items (preferred)
+    - message_text: fallback single raw text (legacy)
+    """
+    # System context variables for date/time normalization
+    sys_context = (
+        f"CURRENT_DATE: {current_date}\n"
+        f"CURRENT_TIME: {current_time}\n"
+        f"TIMEZONE: {timezone}\n"
+    )
+
+    # Prepare the 'user' content with a compact, unambiguous structure.
+    if context_messages:
+        # Keep it minimal; the prompt teaches the model how to use this structure.
+        lines = []
+        for idx, item in enumerate(context_messages, start=1):
+            author = (item.get("author") or "Unknown").strip()
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+            lines.append(f"{idx}) Author: {author} — {text}")
+        if not lines:
+            # No content; rely on no-update behaviour.
+            user_payload = "INPUT MESSAGES: (none)"
+        else:
+            user_payload = "INPUT MESSAGES:\n" + "\n".join(lines)
+    else:
+        # Legacy single message
+        msg = (message_text or "").strip()
+        user_payload = "INPUT MESSAGES:\n1) Author: User — " + (msg if msg else "(none)")
+
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": sys_context},
+        {"role": "user", "content": user_payload},
+    ]
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """
+    Heuristic: retry on timeouts, rate limits, and 5xx-like API errors.
+    We avoid importing exception classes to keep compatibility across client versions.
+    """
+    name = exc.__class__.__name__
+    msg = str(exc).lower()
+    return any(
+        key in (name.lower() + " " + msg)
+        for key in [
+            "timeout", "timed out", "rate", "limit", "overloaded", "server error", "503", "502", "500"
+        ]
+    )
+
+
+def _chat_with_retry(messages: List[Dict[str, str]], user_id: Optional[str] = None) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """
+    Bounded retry wrapper around Chat Completions.
+    Returns (text, usage_dict|None) or raises after final attempt.
+    """
+    if _client is None:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+
+    delay = 1.0
+    last_exc: Optional[Exception] = None
+    for attempt in range(LLM_RETRIES + 1):
+        try:
+            resp = _client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                max_tokens=LLM_MAX_TOKENS,
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P,
+                user=(user_id or None),
+                # Per-call timeout is set at client-level; pass here if your client supports it.
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            usage = getattr(resp, "usage", None)
+            return text, (usage.to_dict() if hasattr(usage, "to_dict") else dict(usage) if usage else None)
+        except Exception as e:
+            last_exc = e
+            if attempt >= LLM_RETRIES or not _is_transient_error(e):
+                # Final fail or non-transient error → raise
+                raise
+            time.sleep(min(delay, LLM_RETRY_MAX_S))
+            delay *= 2.0
+    # Should not reach
+    raise last_exc or RuntimeError("Unknown LLM failure")
+
+
+def _post_trim(text: str) -> str:
+    """
+    Light guardrail to avoid oversized downstream payloads.
+    Does NOT add '-AIOK' — that must be produced by the model itself per spec.
+    """
+    if len(text) > LLM_MAX_CHARS:
+        return text[:LLM_MAX_CHARS].rstrip()
+    return text
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+def generate_reply(
+    *args,
+    **kwargs,
+) -> str:
+    """
+    Backwards-compatible entrypoint.
+
+    Usage patterns supported:
+    1) Legacy single text:
+       generate_reply(message_text="...")
+
+    2) Structured multi-message:
+       generate_reply(
+           context_messages=[{"author": "User A", "text": "..."}, {"author": "User C", "text": "..."}],
+           current_date="20 October 2025",
+           current_time="14:32",
+           timezone="Asia/Singapore",
+           user_id="loop:user_b"   # optional; improves traceability
+       )
+
+    Args (kwargs):
+      - message_text: str (legacy single message)
+      - context_messages: List[Dict[str, str]] with keys {"author","text"}
+      - current_date: str  (e.g., "20 October 2025")
+      - current_time: str  (24h "HH:MM")
+      - timezone:     str  (IANA, default "Asia/Singapore")
+      - user_id:      str  (optional OpenAI 'user' field for traceability)
+
+    Returns:
+      - Model text output (already includes '-AIOK' when appropriate, produced by the model).
+    """
+    # Preferred keywords
+    message_text: str = kwargs.get("message_text") if "message_text" in kwargs else (args[0] if len(args) > 0 else "")
+    context_messages: Optional[List[Dict[str, str]]] = kwargs.get("context_messages")
+    current_date: str = kwargs.get("current_date", "")
+    current_time: str = kwargs.get("current_time", "")
+    timezone: str = kwargs.get("timezone", "Asia/Singapore")
+    user_id: Optional[str] = kwargs.get("user_id")
+
+    messages = _build_user_prompt(
+        context_messages=context_messages,
+        message_text=message_text,
+        current_date=current_date,
+        current_time=current_time,
+        timezone=timezone,
+    )
+    text, usage = _chat_with_retry(messages, user_id=user_id)
+
+    if LLM_LOG_USAGE and usage:
+        try:
+            print(f"[llm] usage prompt={usage.get('prompt_tokens')} completion={usage.get('completion_tokens')} total={usage.get('total_tokens')}")
+        except Exception:
+            pass
+
+    return _post_trim(text)
+
+
+__all__ = ["generate_reply"]
+</file>
+
+<file path="app/main.py">
+# app/main.py
+from __future__ import annotations
+
+import os
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+# Import routers (each file defines its own prefix)
+from app.routes.messages import router as messages_router  # prefix="/api"
+from app.routes.bot import router as bot_router            # prefix="/bot"
+try:
+    from app.routes.feed import router as feed_router      # likely prefix="/api"
+except Exception:
+    feed_router = None
+from app.routes.diag import router as diag_router
+from app.diagnostics import router as diagnostics_router
+
+def _cors_origins() -> list[str]:
+    # Allow local dev + Netlify preview + prod by default; override via CORS_ORIGINS
+    raw = os.getenv("CORS_ORIGINS", "")
+    if raw.strip():
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "https://localhost",
+        "https://127.0.0.1",
+        # Netlify preview/prod domains (wildcards are okay when allow_credentials=False)
+        # Add your actual site domain(s) here if you need credentials.
+        "*",
+    ]
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="Loop API", version="1.0.0")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins(),
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        max_age=600,
+    )
+
+    @app.get("/health")
+    def health():
+        return {"ok": True}
+
+    # Include routers WITHOUT extra prefixes. Each router carries its own.
+    app.include_router(messages_router)  # /api/...
+    app.include_router(bot_router)       # /bot/...
+    app.include_router(diagnostics_router)
+    app.include_router(bot_router, prefix="/bot")       # -> /bot/process
+    app.include_router(bot_router, prefix="/api/bot")   # -> /api/bot/process
+    app.include_router(diag_router)  # /health/db
+    if feed_router is not None:
+        app.include_router(feed_router)  # /api/feed...
+
+    return app
+
+app = create_app()
+</file>
+
+<file path="app/models.py">
+# /Users/arvindrao/loop/loop-api/app/models.py
+from typing import Optional, List, Literal
+from pydantic import BaseModel, Field
+
+Audience = Literal["inbox_to_bot", "bot_to_user", "loop_shared"]
+
+# ---------- Inbox (human -> bot) ----------
+class InboxRequest(BaseModel):
+    thread_id: str
+    content_plain: str
+
+class InboxResponse(BaseModel):
+    message_id: str
+    thread_id: str
+    role: str
+    channel: str
+    visibility: str
+    ok: bool
+    note: Optional[str] = None
+
+# ---------- Publish (kept for backward-compat; not used by humans now) ----------
+class PublishRequest(BaseModel):
+    message_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    latest: Optional[bool] = Field(default=None)
+
+class PublishResponse(BaseModel):
+    publish_id: str
+    message_id: str
+    thread_id: str
+    visibility: str
+    channel: str
+    published_at: str
+    ok: bool = True
+
+# ---------- Human inbox (bot -> human) ----------
+class MeInboxItem(BaseModel):
+    message_id: str
+    thread_id: str
+    content_plain: str
+    created_at: str
+
+class MeInboxResponse(BaseModel):
+    items: List[MeInboxItem]
+    next_cursor: Optional[str] = None
+
+# ---------- Bot inbox (human -> bot) ----------
+class BotInboxItem(BaseModel):
+    message_id: str
+    thread_id: str
+    created_by: str
+    content_plain: str
+    created_at: str
+
+class BotInboxResponse(BaseModel):
+    items: List[BotInboxItem]
+    next_cursor: Optional[str] = None
+
+# ---------- Bot reply (bot -> human) ----------
+class BotReplyRequest(BaseModel):
+    recipient_profile_id: str
+    thread_id: str
+    content_plain: str
+
+class BotReplyResponse(BaseModel):
+    message_id: str
+    thread_id: str
+    recipient_profile_id: str
+    created_at: str
+    ok: bool = True
+</file>
+
+<file path="app/requirements.txt">
+fastapi==0.112.2
+uvicorn[standard]==0.30.6
+psycopg[binary]==3.2.10
+httpx==0.27.0
+python-dotenv==1.0.1
+pydantic==2.9.1
+openai==1.51.2
+orjson==3.10.7
+loguru==0.7.2
+requests==2.32.3
+</file>
+
+<file path="app/supa.py">
+import os
+from typing import Any, Dict, Optional
+
+import httpx
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load env from project root
+ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT / ".env.dev")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
+
+class Supa:
+    def __init__(self, base_url: str, service_key: str):
+        self.base = base_url.rstrip("/")
+        self.headers = {
+            "apikey": service_key,
+            "Authorization": f"Bearer {service_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+        self.client = httpx.Client(timeout=20.0, headers=self.headers)
+
+    def rpc(self, func: str, args: Dict[str, Any]) -> Any:
+        r = self.client.post(f"{self.base}/rest/v1/rpc/{func}", json=args)
+        r.raise_for_status()
+        return r.json()
+
+    def select_one(self, table: str, eq: Dict[str, str], select: str = "*") -> Optional[Dict[str, Any]]:
+        params = {"select": select}
+        for k, v in eq.items():
+            params[k] = f"eq.{v}"
+        r = self.client.get(f"{self.base}/rest/v1/{table}", params=params)
+        r.raise_for_status()
+        data = r.json()
+        return data[0] if data else None
+
+    def insert(self, table: str, row: Dict[str, Any]) -> Dict[str, Any]:
+        r = self.client.post(f"{self.base}/rest/v1/{table}", json=row)
+        r.raise_for_status()
+        data = r.json()
+        return data[0] if isinstance(data, list) and data else data
+
+    def select_many(self, table: str, filters: Dict[str, str], select: str = "*", order: Optional[str] = None, limit: Optional[int] = None) -> Any:
+        """
+        filters: {"thread_id": "<uuid>", "visibility": "shared"} -> thread_id=eq.<uuid>&visibility=eq.shared
+        order: "created_at.asc" or "created_at.desc"
+        """
+        params = {"select": select}
+        for k, v in filters.items():
+            params[k] = f"eq.{v}"
+        if order:
+            params["order"] = order
+        if limit is not None:
+            params["limit"] = str(limit)
+        r = self.client.get(f"{self.base}/rest/v1/{table}", params=params)
+        r.raise_for_status()
+        return r.json()
+
+supa = Supa(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+</file>
+
+<file path="demo.html">
+<!-- /Users/arvindrao/loop/loop-api/app/static/demo.html -->
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Loop Demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+      .card { border: 1px solid #e5e7eb; padding: 1rem; border-radius: 12px; margin-bottom: 1rem; }
+      .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+      textarea { width: 100%; height: 100px; }
+      button { padding: .5rem .9rem; border-radius: 8px; border: 1px solid #d1d5db; background: #f9fafb; cursor: pointer; }
+      button:disabled { opacity: .6; cursor: not-allowed; }
+      code { background: #f3f4f6; padding: 0 .25rem; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>Loop — Web Demo (MVP)</h1>
+    <div class="card">
+      <div class="row">
+        <label>User:</label>
+        <select id="user">
+          <option value="b8d99c3c-0d3a-4773-a324-a6bc60dee64e">User A</option>
+          <option value="0dd8b495-6a25-440d-a6e4-d8b7a77bc688">User B</option>
+        </select>
+        <label>Thread:</label>
+        <select id="thread">
+          <option value="b01164e6-c719-4fb1-b2d0-85755e7ebf38">Seed Thread</option>
+        </select>
+        <span id="health" style="margin-left:auto;">health: <em>unknown</em></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Compose to Inbox</h3>
+      <textarea id="text" placeholder="Type a message…"></textarea>
+      <div class="row">
+        <button id="send">Send</button>
+        <span id="status"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Feed (published)</h3>
+      <div id="feed"></div>
+      <div class="row"><button id="refresh">Refresh</button></div>
+    </div>
+
+    <script>
+      const api = "";
+      const el = (id) => document.getElementById(id);
+
+      async function ping() {
+        try {
+          const r = await fetch(`${api}/health`);
+          el("health").innerHTML = `health: <code>${r.status}</code>`;
+        } catch {
+          el("health").textContent = "health: error";
+        }
+      }
+
+      async function send() {
+        const thread_id = el("thread").value;
+        const user = el("user").value;
+        const content_plain = el("text").value.trim();
+        if (!content_plain) return;
+
+        el("send").disabled = true;
+        el("status").textContent = "sending…";
+
+        try {
+          const r = await fetch(`${api}/messages/inbox`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-User-Id": user },
+            body: JSON.stringify({ thread_id, content_plain }),
+          });
+          const j = await r.json();
+          el("status").textContent = r.ok ? "sent (inbox)" : `error: ${j.detail || r.status}`;
+        } catch (e) {
+          el("status").textContent = "error";
+        } finally {
+          el("send").disabled = false;
+        }
+      }
+
+      async function refresh() {
+        // This will work after we add the feed endpoint in the next step.
+        el("feed").innerHTML = "<em>Feed wiring comes in Step 2.</em>";
+      }
+
+      el("send").addEventListener("click", send);
+      el("refresh").addEventListener("click", refresh);
+
+      ping();
+    </script>
+  </body>
+</html>
+</file>
+
+<file path="Makefile">
+run:
+	. .venv/bin/activate && python -m uvicorn app.main:app --host 127.0.0.1 --port 8080
+
+freeze:
+	. .venv/bin/activate && pip freeze > requirements.lock
+</file>
+
+<file path="requirements.lock">
+annotated-types==0.7.0
+anyio==4.10.0
+certifi==2025.8.3
+click==8.2.1
+distro==1.9.0
+fastapi==0.112.2
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.6.4
+httpx==0.27.0
+idna==3.10
+jiter==0.10.0
+loguru==0.7.2
+openai==1.51.2
+orjson==3.10.7
+psycopg==3.2.10
+psycopg-binary==3.2.10
+pydantic==2.9.1
+pydantic_core==2.23.3
+python-dotenv==1.0.1
+PyYAML==6.0.2
+sniffio==1.3.1
+starlette==0.38.6
+tqdm==4.67.1
+typing_extensions==4.15.0
+uvicorn==0.30.6
+uvloop==0.21.0
+watchfiles==1.1.0
+websockets==15.0.1
+</file>
+
+<file path="requirements.txt">
+fastapi==0.112.2
+uvicorn[standard]==0.30.6
+psycopg[binary]==3.2.10
+httpx==0.27.0
+python-dotenv==1.0.1
+pydantic==2.9.1
+openai==1.51.2
+orjson==3.10.7
+loguru==0.7.2
+</file>
+
+</files>
