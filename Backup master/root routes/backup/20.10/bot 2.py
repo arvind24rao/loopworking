@@ -82,66 +82,6 @@ def _now_singapore() -> tuple[str, str, str]:
     current_time = now.strftime("%H:%M")
     return current_date, current_time, "Asia/Singapore"
 
-def _loop_id_for_member(conn: psycopg.Connection, member_id: str) -> Optional[str]:
-    with conn.cursor() as cur:
-        cur.execute("SELECT loop_id FROM members WHERE id = %s", (member_id,))
-        row = cur.fetchone()
-        return row["loop_id"] if row else None
-
-def _bot_member_id_for_loop(conn: psycopg.Connection, loop_id: str, bot_profile_id: str) -> Optional[str]:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id FROM members WHERE loop_id = %s AND profile_id = %s",
-            (loop_id, bot_profile_id),
-        )
-        row = cur.fetchone()
-        return row["id"] if row else None
-
-def _profile_handle(conn: psycopg.Connection, profile_id: str) -> Optional[str]:
-    """
-    Resolve a user's handle for nicer author attribution.
-    Returns None if not found.
-    """
-    with conn.cursor() as cur:
-        cur.execute("SELECT handle FROM profiles WHERE id = %s", (profile_id,))
-        row = cur.fetchone()
-        handle = row["handle"] if row else None
-        if handle:
-            handle = handle.strip()
-        return handle or None
-
-def _author_label(conn: psycopg.Connection, profile_id: str) -> str:
-    """
-    Prefer @handle; else 'User <uuid-prefix>'.
-    """
-    handle = _profile_handle(conn, profile_id)
-    if handle:
-        # Avoid duplicating '@' if already present
-        return f"@{handle}" if not handle.startswith("@") else handle
-    return f"User {profile_id[:8]}"
-
-def _recipients_for_loop(conn: psycopg.Connection, loop_id: str, exclude_profile_ids: List[str]) -> List[str]:
-    """
-    recipients = members.profile_id in loop MINUS exclude set
-    (exclude must include author_profile_id and bot_profile_id)
-    """
-    if exclude_profile_ids:
-        ph = ", ".join(["%s"] * len(exclude_profile_ids))
-        sql = f"""
-          SELECT profile_id
-          FROM members
-          WHERE loop_id = %s
-            AND profile_id NOT IN ({ph})
-        """
-        args: List[Any] = [loop_id, *exclude_profile_ids]
-    else:
-        sql = "SELECT profile_id FROM members WHERE loop_id = %s"
-        args = [loop_id]
-
-    with conn.cursor() as cur:
-        cur.execute(sql, tuple(args))
-        return [r["profile_id"] for r in cur.fetchall()]
-
 # =============================== SQL helpers ==========================
 
 def _fetch_unprocessed_humans(
@@ -168,6 +108,43 @@ def _fetch_unprocessed_humans(
     with conn.cursor() as cur:
         cur.execute(sql, tuple(args))
         return list(cur.fetchall())
+
+def _loop_id_for_member(conn: psycopg.Connection, member_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT loop_id FROM members WHERE id = %s", (member_id,))
+        row = cur.fetchone()
+        return row["loop_id"] if row else None
+
+def _bot_member_id_for_loop(conn: psycopg.Connection, loop_id: str, bot_profile_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM members WHERE loop_id = %s AND profile_id = %s",
+            (loop_id, bot_profile_id),
+        )
+        row = cur.fetchone()
+        return row["id"] if row else None
+
+def _recipients_for_loop(conn: psycopg.Connection, loop_id: str, exclude_profile_ids: List[str]) -> List[str]:
+    """
+    recipients = members.profile_id in loop MINUS exclude set
+    (exclude must include author_profile_id and bot_profile_id)
+    """
+    if exclude_profile_ids:
+        ph = ", ".join(["%s"] * len(exclude_profile_ids))
+        sql = f"""
+          SELECT profile_id
+          FROM members
+          WHERE loop_id = %s
+            AND profile_id NOT IN ({ph})
+        """
+        args: List[Any] = [loop_id, *exclude_profile_ids]
+    else:
+        sql = "SELECT profile_id FROM members WHERE loop_id = %s"
+        args = [loop_id]
+
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(args))
+        return [r["profile_id"] for r in cur.fetchall()]
 
 def _insert_bot_dm(
     conn: psycopg.Connection,
@@ -286,19 +263,20 @@ def process_queue(
                 previews: List[Dict[str, str]] = []
                 new_ids: List[str] = []
 
-                # Author label for nicer summaries
-                author = _author_label(conn, author_profile_id)
-
+                # If we have no human text, still add previews (empty) but don't insert
                 for pid in recipients:
+                    # Build model input using your relay-composer contract
+                    # Prefer structured multi-message with author label and the human text.
                     reply_text = ""
                     if human_plaintext:
                         reply_text = generate_reply(
-                            context_messages=[{"author": author, "text": human_plaintext}],
+                            context_messages=[{"author": author_profile_id, "text": human_plaintext}],
                             current_date=current_date,
                             current_time=current_time,
                             timezone=tz_name,
                             user_id=f"loop:{pid}",
                         )
+                        # Trim/guardrail is handled inside llm wrapper; reply_text may still be "" in edge cases.
 
                     if dry_run:
                         previews.append({"recipient_profile_id": pid, "content": reply_text})
@@ -314,6 +292,7 @@ def process_queue(
                             )
                             new_ids.append(new_id)
                         else:
+                            # Count a skip for visibility when model returns empty
                             stats.skipped += 1
 
                 if not dry_run:
@@ -324,6 +303,7 @@ def process_queue(
                 else:
                     item.previews = previews
 
+                # If absolutely nothing could be generated, annotate item
                 if not dry_run and not new_ids:
                     item.skipped_reason = item.skipped_reason or "empty_llm_reply"
 
