@@ -8,4 +8,4 @@ openai==1.51.2
 orjson==3.10.7
 loguru==0.7.2
 requests==2.32.3
-
+PyJWT[crypto]==2.9.0
