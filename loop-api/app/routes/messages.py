@@ -1,57 +1,26 @@
 # app/routes/messages.py
-from __future__ import annotations
-
+import os
 import uuid
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Body
+from fastapi import APIRouter, Body, Query, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.db import get_conn  # psycopg connection factory
-from app.crypto import seal_plaintext  # returns "cipher:<text>" per handbook
+from app.db import get_conn  # your existing connection helper
+from app.crypto import seal_plaintext, strip_cipher as _strip_cipher  # keep existing names if different
 
-router = APIRouter(prefix="/api", tags=["website-facade"])
-
+# Constants (keep aligned with your codebase)
 INBOX_TO_BOT = "inbox_to_bot"
 BOT_TO_USER = "bot_to_user"
 
+# Env
+AUTH_MODE = (os.getenv("AUTH_MODE") or "permissive").strip().lower()
 
-# ----------------------------- Models ---------------------------------------
+router = APIRouter()
 
-class SendMessagePayload(BaseModel):
-    thread_id: str = Field(..., description="UUID of the thread")
-    user_id: str = Field(..., description="Profile UUID of the human sender")
-    content: str = Field(..., min_length=1, max_length=4000)
-
-
-class MessageOut(BaseModel):
-    id: str
-    thread_id: str
-    created_at: str
-    created_by: str
-    author_member_id: Optional[str] = None
-    audience: str
-    recipient_profile_id: Optional[str] = None
-    content: str  # plaintext (cipher shim removed)
-
-
-class GetMessagesResponse(BaseModel):
-    ok: bool = True
-    items: List[MessageOut] = []
-
-
-# --------------------------- Helpers ----------------------------------------
-
-def _strip_cipher(cipher_text: Optional[str]) -> str:
-    """
-    Remove the 'cipher:' shim prefix. Returns empty string on None.
-    """
-    if not cipher_text:
-        return ""
-    if cipher_text.startswith("cipher:"):
-        return cipher_text[len("cipher:") :].strip()
-    return cipher_text.strip()
-
+# ------------------------------------------------------------------------------
+# Helper functions (same semantics as your existing code)
+# ------------------------------------------------------------------------------
 
 def _thread_exists_and_loop_id(conn, thread_id: str) -> str:
     with conn.cursor() as cur:
@@ -61,7 +30,6 @@ def _thread_exists_and_loop_id(conn, thread_id: str) -> str:
             raise HTTPException(status_code=404, detail="Thread not found")
         (loop_id,) = row
         return str(loop_id)
-
 
 def _author_member_id(conn, *, loop_id: str, profile_id: str) -> str:
     """
@@ -81,8 +49,7 @@ def _author_member_id(conn, *, loop_id: str, profile_id: str) -> str:
         (member_id,) = row
         return str(member_id)
 
-
-def _row_to_message_out(row: Dict[str, Any]) -> MessageOut:
+def _row_to_message_out(row: Dict[str, Any]) -> "MessageOut":
     return MessageOut(
         id=str(row["id"]),
         thread_id=str(row["thread_id"]),
@@ -94,11 +61,35 @@ def _row_to_message_out(row: Dict[str, Any]) -> MessageOut:
         content=_strip_cipher(row["content_ciphertext"]),
     )
 
+# ------------------------------------------------------------------------------
+# Pydantic models (kept 1:1 with your OpenAPI)
+# ------------------------------------------------------------------------------
 
-# ---------------------------- Routes ----------------------------------------
+class SendMessagePayload(BaseModel):
+    thread_id: str = Field(..., description="UUID of the thread")
+    user_id: str = Field(..., description="Profile UUID of the human sender")
+    content: str = Field(..., min_length=1, max_length=4000)
 
-@router.post("/send_message", response_model=MessageOut)
-def send_message(payload: SendMessagePayload = Body(...)):
+class MessageOut(BaseModel):
+    id: str
+    thread_id: str
+    created_at: str
+    created_by: str
+    author_member_id: Optional[str] = None
+    audience: str
+    recipient_profile_id: Optional[str] = None
+    content: str
+
+class GetMessagesResponse(BaseModel):
+    ok: bool = True
+    items: List[MessageOut] = []
+
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
+
+@router.post("/api/send_message", response_model=MessageOut, tags=["website-facade"], summary="Send Message")
+def send_message(request: Request, payload: SendMessagePayload = Body(...)):
     """
     Insert a human -> bot message in the given thread.
 
@@ -106,11 +97,21 @@ def send_message(payload: SendMessagePayload = Body(...)):
     - Validates thread and membership.
     - Inserts a row into messages with audience='inbox_to_bot'.
     - Returns the inserted row (plaintext content).
+
+    Auth overlay:
+    - If a valid JWT is present, we ignore payload.user_id and derive the sender from the token (request.state.auth_uid).
+    - In strict mode, a missing token yields 401.
     """
+    auth_uid = getattr(request.state, "auth_uid", None)
+    if AUTH_MODE == "strict" and not auth_uid:
+        raise HTTPException(status_code=401, detail="Authorization required")
+
+    # Determine effective profile id (from token if present, else from payload in permissive mode)
+    effective_profile_id: Optional[str] = auth_uid or payload.user_id
     try:
         thread_uuid = str(uuid.UUID(payload.thread_id))
-        user_uuid = str(uuid.UUID(payload.user_id))
-    except ValueError:
+        user_uuid = str(uuid.UUID(effective_profile_id))
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid UUID in thread_id or user_id")
 
     with get_conn() as conn:
@@ -137,7 +138,7 @@ def send_message(payload: SendMessagePayload = Body(...)):
                         uuid.UUID(user_uuid),
                         uuid.UUID(author_member_id),
                         INBOX_TO_BOT,
-                        None,  # no recipient for human->bot
+                        None,
                         sealed,
                     ),
                 )
@@ -168,9 +169,9 @@ def send_message(payload: SendMessagePayload = Body(...)):
             conn.rollback()
             raise
 
-
-@router.get("/get_messages", response_model=GetMessagesResponse)
+@router.get("/api/get_messages", response_model=GetMessagesResponse, tags=["website-facade"], summary="Get Messages")
 def get_messages(
+    request: Request,
     thread_id: str = Query(..., description="Thread UUID"),
     user_id: str = Query(..., description="Profile UUID of the viewer whose DM stream we are showing"),
     limit: int = Query(200, ge=1, le=1000),
@@ -181,16 +182,19 @@ def get_messages(
     - Human->Bot rows authored by this viewer (their own sent messages), AND
     - Bot->User rows targeted at this viewer (bot's DMs to them).
 
-    This allows the frontend to render:
-      - A or B (viewer’s human posts)      -> audience='inbox_to_bot'
-      - Bot→Viewer (personalised bot rows) -> audience='bot_to_user' AND recipient_profile_id=user_id
-
-    Response items include `audience` and `recipient_profile_id` so the UI can
-    split panes for A, B, Bot→A, Bot→B if needed.
+    Auth overlay:
+    - If a valid JWT is present, the *viewer* is forced to the token subject.
+    - In strict mode, a missing token yields 401.
     """
+    auth_uid = getattr(request.state, "auth_uid", None)
+    if AUTH_MODE == "strict" and not auth_uid:
+        raise HTTPException(status_code=401, detail="Authorization required")
+
+    viewer_profile_id: str = auth_uid or user_id
+
     try:
         thread_uuid = uuid.UUID(thread_id)
-        user_uuid = uuid.UUID(user_id)
+        viewer_uuid = uuid.UUID(viewer_profile_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid UUID in thread_id or user_id")
 
@@ -199,7 +203,7 @@ def get_messages(
         _ = _thread_exists_and_loop_id(conn, str(thread_uuid))
 
         with conn.cursor() as cur:
-            # We select both sets and UNION ALL with ordering by created_at asc
+            # Select both sets and UNION ALL with ordering by created_at asc
             cur.execute(
                 """
                 select id, thread_id, created_at, created_by, author_member_id,
@@ -229,10 +233,10 @@ def get_messages(
                 (
                     thread_uuid,
                     INBOX_TO_BOT,
-                    user_uuid,
+                    viewer_uuid,
                     thread_uuid,
                     BOT_TO_USER,
-                    user_uuid,
+                    viewer_uuid,
                     limit,
                 ),
             )
@@ -250,4 +254,4 @@ def get_messages(
         ]
         items = [_row_to_message_out(dict(zip(cols, r))) for r in rows]
 
-        return GetMessagesResponse(ok=True, items=items)
+    return GetMessagesResponse(ok=True, items=items)
