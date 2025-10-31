@@ -7,7 +7,7 @@ from fastapi import APIRouter, Body, Query, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.db import get_conn  # your existing connection helper
-from app.crypto import seal_plaintext, strip_cipher as _strip_cipher  # keep existing names if different
+from app.crypto import seal_plaintext  # keep only this import
 
 # Constants (keep aligned with your codebase)
 INBOX_TO_BOT = "inbox_to_bot"
@@ -19,8 +19,17 @@ AUTH_MODE = (os.getenv("AUTH_MODE") or "permissive").strip().lower()
 router = APIRouter()
 
 # ------------------------------------------------------------------------------
-# Helper functions (same semantics as your existing code)
+# Local helpers
 # ------------------------------------------------------------------------------
+
+def _strip_cipher(value: Optional[str]) -> str:
+    """
+    Pass-through plaintext or remove the 'cipher:' prefix (your existing convention).
+    Mirrors the decode() you use elsewhere.
+    """
+    if not value:
+        return ""
+    return value[7:].strip() if value.startswith("cipher:") else value
 
 def _thread_exists_and_loop_id(conn, thread_id: str) -> str:
     with conn.cursor() as cur:

@@ -7,7 +7,6 @@ from fastapi import APIRouter, Query, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.db import get_conn
-from app.crypto import strip_cipher as _strip_cipher  # if you need it elsewhere
 
 # Env / config
 AUTH_MODE = (os.getenv("AUTH_MODE") or "permissive").strip().lower()
@@ -67,14 +66,7 @@ def process_queue(
     """
     _ = _require_bot_operator(request)
 
-    # You already have the concrete implementation in your existing codebase that:
-    #  - Scans messages in the given (or all) thread(s) with audience='inbox_to_bot'
-    #  - Generates per-recipient bot_to_user messages or previews
-    #  - Marks source human rows with bot_processed_at when dry_run=False
-    #
-    # Below is a thin glue that assumes you keep your current internal logic
-    # (e.g., a service function) and only adds the auth gate above.
-
+    # Hook into your existing processing logic here.
     scanned = 0
     processed = 0
     inserted = 0
@@ -82,22 +74,13 @@ def process_queue(
     items: List[BotProcessItem] = []
 
     with get_conn() as conn:
-        # ---- PLACEHOLDER HOOK ----
-        # Call your existing processing function here.
-        # Example:
-        #   results = process_messages(conn, only_thread_id=thread_uuid_or_none, limit=limit, dry_run=dry_run)
-        #   and then convert results → BotProcessItem(...)
-        #
-        # For clarity, we leave the core logic untouched and only demonstrate shape:
         if thread_id:
             try:
                 _ = uuid.UUID(thread_id)
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid thread_id")
 
-        # (No-op body; replace with your actual implementation call)
-        # Keep stats consistent with your behaviour.
-        pass
+        # TODO: call your existing processing function and populate stats/items.
 
     stats = BotProcessStats(scanned=scanned, processed=processed, inserted=inserted, skipped=skipped, dry_run=dry_run)
     return BotProcessResponse(ok=True, stats=stats, items=items)
