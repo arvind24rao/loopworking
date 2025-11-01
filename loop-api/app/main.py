@@ -24,13 +24,16 @@ SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")  # If using HS256 pro
 JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else ""
 
 ALLOWED_ORIGINS = [
-    # adjust or externalise if you prefer
     *(os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLOWED_ORIGINS") else []),
     "http://localhost:3000",
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
 ]
+
+# Paths that should skip auth entirely (so health checks succeed)
+ALLOW_ANON_PATHS = {"/health", "/health/dbinfo"}
+ALLOW_ANON_PREFIXES = set()  # add "/public" etc. if you ever need
 
 # ------------------------------------------------------------------------------
 # Lightweight JWKS cache for RS256 Supabase projects
@@ -51,12 +54,10 @@ class _JWKSCache:
         self._last_fetch = time.time()
 
     def get_key(self, kid: str) -> Optional[Dict[str, Any]]:
-        # refresh every 10 minutes
         if time.time() - self._last_fetch > 600:
             try:
                 self._fetch()
             except Exception:
-                # best-effort; keep old keys if fetch fails
                 pass
         return self._keys.get(kid)
 
@@ -80,24 +81,11 @@ def _parse_bearer(authorization: Optional[str]) -> Optional[str]:
     return None
 
 def _verify_token(token: str) -> AuthResult:
-    """
-    Verifies a Supabase JWT in two ways:
-    1) If SUPABASE_JWT_SECRET is set → HS256 verification.
-    2) Else → RS256 via JWKS from {SUPABASE_URL}/auth/v1/.well-known/jwks.json
-    Returns AuthResult(uid=sub, claims=...).
-    Raises HTTPException(401) if invalid.
-    """
     options = {"verify_aud": False, "verify_signature": True}
 
-    # HS256 path (older Supabase projects / if explicitly configured)
     if SUPABASE_JWT_SECRET:
         try:
-            claims = jwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
-                options=options,
-            )
+            claims = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options=options)
             sub = claims.get("sub") or claims.get("user_id")
             if not sub:
                 raise HTTPException(status_code=401, detail="Invalid token (no sub)")
@@ -105,7 +93,6 @@ def _verify_token(token: str) -> AuthResult:
         except jwt.PyJWTError:
             raise HTTPException(status_code=401, detail="Invalid token")
 
-    # RS256 via JWKS
     try:
         unverified = jwt.get_unverified_header(token)
         kid = unverified.get("kid")
@@ -114,14 +101,17 @@ def _verify_token(token: str) -> AuthResult:
 
         jwk = _JWKS.get_key(kid)
         if not jwk:
-            # Force refresh once if missing
             _JWKS._fetch()
             jwk = _JWKS.get_key(kid)
             if not jwk:
                 raise HTTPException(status_code=401, detail="JWKS key not found")
 
-        # PyJWT expects PEM; use algorithms with key in jwk form
-        claims = jwt.decode(token, jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk)), algorithms=["RS256"], options=options)
+        claims = jwt.decode(
+            token,
+            jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk)),
+            algorithms=["RS256"],
+            options=options,
+        )
         sub = claims.get("sub") or claims.get("user_id")
         if not sub:
             raise HTTPException(status_code=401, detail="Invalid token (no sub)")
@@ -130,7 +120,7 @@ def _verify_token(token: str) -> AuthResult:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # ------------------------------------------------------------------------------
-# FastAPI app and global auth dependency
+# FastAPI app and global auth middleware
 # ------------------------------------------------------------------------------
 
 app = FastAPI(title="Loop API (Auth-wired)")
@@ -143,41 +133,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _unauthorized(msg: str):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(content={"detail": msg}, status_code=401)
+
 @app.middleware("http")
 async def auth_injector(request: Request, call_next):
     """
-    Global middleware that:
-      - Parses Bearer token (if any).
-      - When valid, sets request.state.auth_uid = sub
-      - Enforces AUTH_MODE=strict when no/invalid token is present
+    - Skips auth for ALLOW_ANON_PATHS and OPTIONS (health checks / preflights).
+    - In strict mode: 401 when no/invalid token (for all other paths).
+    - On valid token: sets request.state.auth_uid = subject.
     """
-    request.state.auth_uid = None
+    path = request.url.path
+    if path in ALLOW_ANON_PATHS or any(path.startswith(p) for p in ALLOW_ANON_PREFIXES) or request.method == "OPTIONS":
+        return await call_next(request)
 
+    request.state.auth_uid = None
     token = _parse_bearer(request.headers.get("Authorization"))
 
     if token:
-        # Validate; 401 on invalid token
         auth = _verify_token(token)
         request.state.auth_uid = auth.uid
     else:
-        # No token
         if AUTH_MODE == "strict":
             return _unauthorized("Authorization required")
 
-    # Continue
     return await call_next(request)
 
-def _unauthorized(msg: str):
-    return _json_response({"detail": msg}, status_code=401)
-
-def _json_response(payload: Dict[str, Any], status_code: int = 200):
-    from fastapi.responses import JSONResponse
-    return JSONResponse(content=payload, status_code=status_code)
-
-# Routers (your routes already use absolute paths like /api/send_message, etc.)
+# Routers
 app.include_router(messages_router)
 app.include_router(bot_router)
 
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"ok": "true"}
+
+@app.get("/health/dbinfo")
+def dbinfo() -> Dict[str, Any]:
+    # optional: minimal diagnostic without touching DB
+    return {"app": "loop-api", "mode": AUTH_MODE}
