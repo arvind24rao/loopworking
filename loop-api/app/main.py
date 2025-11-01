@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import jwt  # PyJWT
+from jwt import ExpiredSignatureError, InvalidTokenError
 import requests
 
 # Routers
@@ -80,30 +81,95 @@ def _parse_bearer(authorization: Optional[str]) -> Optional[str]:
         return parts[1]
     return None
 
-def _verify_token(token: str) -> AuthResult:
+# def _verify_token(token: str) -> AuthResult:
+#     options = {"verify_aud": False, "verify_signature": True}
+
+#     if SUPABASE_JWT_SECRET:
+#         try:
+#             claims = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options=options)
+#             sub = claims.get("sub") or claims.get("user_id")
+#             if not sub:
+#                 raise HTTPException(status_code=401, detail="Invalid token (no sub)")
+#             return AuthResult(sub, claims)
+#         except jwt.PyJWTError:
+#             raise HTTPException(status_code=401, detail="Invalid token")
+
+#     try:
+#         unverified = jwt.get_unverified_header(token)
+#         kid = unverified.get("kid")
+#         if not kid:
+#             raise HTTPException(status_code=401, detail="Invalid token (no kid)")
+
+#         jwk = _JWKS.get_key(kid)
+#         if not jwk:
+#             _JWKS._fetch()
+#             jwk = _JWKS.get_key(kid)
+#             if not jwk:
+#                 raise HTTPException(status_code=401, detail="JWKS key not found")
+
+#         claims = jwt.decode(
+#             token,
+#             jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk)),
+#             algorithms=["RS256"],
+#             options=options,
+#         )
+#         sub = claims.get("sub") or claims.get("user_id")
+#         if not sub:
+#             raise HTTPException(status_code=401, detail="Invalid token (no sub)")
+#         return AuthResult(sub, claims)
+#     except jwt.PyJWTError:
+#         raise HTTPException(status_code=401, detail="Invalid token")
+
+def _verify_token(token: str) -> "AuthResult":
+    """
+    Verifies a Supabase Auth access_token.
+    Uses HS256 with SUPABASE_JWT_SECRET if set; otherwise falls back to RS256 (JWKS).
+    Returns AuthResult on success; raises HTTPException 401 on invalid/expired tokens.
+    Adds DEBUG prints so we can see what path is taken and why it failed.
+    """
     options = {"verify_aud": False, "verify_signature": True}
 
-    if SUPABASE_JWT_SECRET:
+    if not token or not token.strip():
+        print("🔴 _verify_token: missing bearer token", flush=True)
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    # Debug: show which path we take (HS256 vs RS256)
+    use_hs256 = bool(SUPABASE_JWT_SECRET)
+    print(f"🔎 _verify_token: path={'HS256' if use_hs256 else 'RS256'} "
+          f"secret_set={use_hs256} jwks_url={'set' if JWKS_URL else 'unset'}", flush=True)
+
+    # Try HS256 with SUPABASE_JWT_SECRET
+    if use_hs256:
         try:
             claims = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options=options)
             sub = claims.get("sub") or claims.get("user_id")
             if not sub:
+                print("🔴 _verify_token HS256: no 'sub' in claims", flush=True)
                 raise HTTPException(status_code=401, detail="Invalid token (no sub)")
+            print(f"✅ _verify_token HS256: sub={sub} aud={claims.get('aud')} iss={claims.get('iss')}", flush=True)
             return AuthResult(sub, claims)
-        except jwt.PyJWTError:
+        except ExpiredSignatureError:
+            print("🔴 _verify_token HS256: token expired", flush=True)
+            raise HTTPException(status_code=401, detail="Token expired")
+        except InvalidTokenError as e:
+            print(f"🔴 _verify_token HS256: invalid token: {e}", flush=True)
             raise HTTPException(status_code=401, detail="Invalid token")
 
+    # Fallback RS256 (JWKS)
     try:
         unverified = jwt.get_unverified_header(token)
         kid = unverified.get("kid")
         if not kid:
+            print("🔴 _verify_token RS256: no 'kid' in header", flush=True)
             raise HTTPException(status_code=401, detail="Invalid token (no kid)")
 
         jwk = _JWKS.get_key(kid)
         if not jwk:
+            print("ℹ️ _verify_token RS256: refreshing JWKS", flush=True)
             _JWKS._fetch()
             jwk = _JWKS.get_key(kid)
             if not jwk:
+                print("🔴 _verify_token RS256: key not found in JWKS", flush=True)
                 raise HTTPException(status_code=401, detail="JWKS key not found")
 
         claims = jwt.decode(
@@ -114,9 +180,16 @@ def _verify_token(token: str) -> AuthResult:
         )
         sub = claims.get("sub") or claims.get("user_id")
         if not sub:
+            print("🔴 _verify_token RS256: no 'sub' in claims", flush=True)
             raise HTTPException(status_code=401, detail="Invalid token (no sub)")
+        print(f"✅ _verify_token RS256: sub={sub} aud={claims.get('aud')} iss={claims.get('iss')}", flush=True)
         return AuthResult(sub, claims)
-    except jwt.PyJWTError:
+
+    except ExpiredSignatureError:
+        print("🔴 _verify_token RS256: token expired", flush=True)
+        raise HTTPException(status_code=401, detail="Token expired")
+    except InvalidTokenError as e:
+        print(f"🔴 _verify_token RS256: invalid token: {e}", flush=True)
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # ------------------------------------------------------------------------------
