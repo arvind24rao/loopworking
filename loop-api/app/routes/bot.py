@@ -81,7 +81,7 @@ def process_queue(
 
     Auth: Always requires a Bot Operator token (even in permissive mode).
     """
-    _ = _require_bot_operator(request)
+    operator_id = _require_bot_operator(request)
 
     # Hook into your existing processing logic here.
     # scanned = 0
@@ -127,6 +127,7 @@ def process_queue(
                     from messages m
                     where m.audience = %s
                       and m.thread_id = %s
+                      and m.bot_processed_at is null
                     order by m.created_at asc
                     limit %s
                     """,
@@ -138,6 +139,7 @@ def process_queue(
                     select m.id, m.thread_id, m.created_by, m.content_ciphertext
                     from messages m
                     where m.audience = %s
+                      and m.bot_processed_at is null
                     order by m.created_at asc
                     limit %s
                     """,
@@ -210,6 +212,13 @@ def process_queue(
                             ),
                         )
                         bot_row_ids.append(str(cur.fetchone()[0]))
+
+                # Mark the source message as processed
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "update messages set bot_processed_at = now(), bot_processed_by = %s where id = %s",
+                        (uuid.UUID(operator_id), uuid.UUID(str(msg_id)))
+                    )
 
                 inserted += len(bot_row_ids)
                 processed += 1
