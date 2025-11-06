@@ -7,6 +7,10 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi import Response
+
 import jwt  # PyJWT
 from jwt import ExpiredSignatureError, InvalidTokenError
 import requests
@@ -198,6 +202,17 @@ def _verify_token(token: str) -> "AuthResult":
 
 app = FastAPI(title="Loop API (Auth-wired)")
 
+# Serve files in app/static at /static/*
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+@app.get("/console")
+def console():
+    # Always serve the latest console page (avoid stale caches)
+    path = "app/static/console.html"
+    resp = FileResponse(path, media_type="text/html")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o for o in ALLOWED_ORIGINS if o],
@@ -205,6 +220,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def no_cache_console_assets(request, call_next):
+    response = await call_next(request)
+    p = request.url.path
+    if p == "/console" or p == "/static/app.js":
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 def _unauthorized(msg: str):
     from fastapi.responses import JSONResponse
