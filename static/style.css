@@ -1,0 +1,286 @@
+/* ==========================================================================
+   loop — shared styles (landing, demo, console)
+   ========================================================================== */
+
+:root {
+  --bg: #000000;
+  --fg: #ffffff;
+  --muted: #9aa0a6;
+  --accent: #2da4ff;
+
+  --card-bg: rgba(255,255,255,0.04);
+  --card-bd: rgba(255,255,255,0.08);
+  --soft-bd: rgba(255,255,255,0.10);
+
+  --pill-bg: #101010;
+  --pill-bd: rgba(255,255,255,0.10);
+
+  --btn-bg: #1b1b1b;
+  --btn-bd: rgba(255,255,255,0.12);
+  --btn-blue-bg: #111a2a;
+  --btn-blue-bd: #223654;
+
+  --surface-0: #0b0b0b;
+
+  --radius-lg: 16px;
+  --radius-md: 12px;
+  --radius-sm: 10px;
+
+  --space-1: 6px;
+  --space-2: 8px;
+  --space-3: 10px;
+  --space-4: 12px;
+  --space-5: 14px;
+  --space-6: 16px;
+  --space-7: 18px;
+  --space-8: 24px;
+
+  --max-content: 1200px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a { color: inherit; text-decoration: none; }
+button { font: inherit; }
+textarea, input { font: inherit; color: var(--fg); }
+
+/* Utilities */
+.muted { color: var(--muted); }
+.row { display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; }
+.center { display: grid; place-items: center; }
+.hidden { display: none !important; }
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--btn-bd);
+  background: var(--btn-bg);
+  color: var(--fg);
+  cursor: pointer;
+  user-select: none;
+  transition: transform .02s ease, background .15s ease, border-color .15s ease;
+}
+.btn:hover { transform: translateY(-0.5px); }
+.btn:active { transform: translateY(0); }
+.btn.blue { background: var(--btn-blue-bg); border-color: var(--btn-blue-bd); }
+
+/* Cards */
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--card-bd);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.card > h2 {
+  margin: 0;
+  padding: var(--space-6) var(--space-6);
+  border-bottom: 1px solid var(--card-bd);
+  font-size: 16px;
+  font-weight: 600;
+  color: #e8eaed;
+}
+.card .content {
+  padding: var(--space-6);
+}
+
+/* Inputs */
+textarea {
+  width: 100%;
+  min-height: 56px;
+  resize: vertical;
+  border-radius: var(--radius-md);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--soft-bd);
+  background: var(--surface-0);
+}
+input[type="text"], input[type="url"], input[type="search"] {
+  width: 100%;
+  border-radius: var(--radius-md);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--soft-bd);
+  background: var(--surface-0);
+}
+
+/* Pills */
+.statuspill {
+  display: inline-block;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--pill-bg);
+  border: 1px solid var(--pill-bd);
+  color: #d3d7de;
+  font-size: 12px;
+}
+
+/* Preview boxes */
+.previewBox {
+  min-height: 62px;
+  padding: var(--space-5);
+  border-radius: var(--radius-md);
+  background: var(--surface-0);
+  border: 1px solid var(--soft-bd);
+  white-space: pre-wrap;
+}
+
+/* ==========================================================================
+   Sidebar layout (landing + demo)
+   ========================================================================== */
+
+.layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: 100vh;
+}
+
+nav#sidebar {
+  padding: var(--space-6);
+  border-right: 1px solid var(--card-bd);
+}
+#sidebar .brand {
+  font-weight: 700;
+  letter-spacing: .5px;
+  margin-bottom: var(--space-6);
+}
+#sidebar .navlink {
+  display: block;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  margin: 6px 0;
+  color: var(--fg);
+}
+#sidebar .navlink[aria-current="page"] {
+  background: rgba(255,255,255,0.06);
+  border-left: 3px solid var(--accent);
+  padding-left: 9px;
+}
+
+main {
+  padding: var(--space-8);
+  max-width: var(--max-content);
+  width: 100%;
+}
+
+/* Common grids for landing/demo */
+.grid { display: grid; gap: var(--space-6); grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid3 { display: grid; gap: var(--space-5); grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.split { display: grid; gap: var(--space-5); grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.composer { display: flex; gap: var(--space-3); align-items: flex-start; }
+
+/* Responsive */
+@media (max-width: 880px) {
+  .layout { grid-template-columns: 1fr; }
+  nav#sidebar { border-right: none; border-bottom: 1px solid var(--card-bd); }
+  main { padding: var(--space-6); }
+  .grid, .grid3, .split { grid-template-columns: 1fr; }
+}
+
+/* ==========================================================================
+   Console page (console.html) legacy grid & elements
+   ========================================================================== */
+
+/* The console uses a .wrap grid of cards:
+   - Connection
+   - User A / User B
+   - Bot → A / Bot → B
+   - Console log (optional)
+   These selectors preserve the existing structure while matching the new look.
+*/
+
+.wrap {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-6);
+  margin: var(--space-8) 0;
+}
+
+@media (min-width: 1200px) {
+  .wrap {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* Headers in console cards */
+.card .subtle {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* Feeds */
+.feed {
+  display: grid;
+  gap: var(--space-4);
+}
+.feed .item {
+  padding: var(--space-4);
+  border: 1px dashed var(--card-bd);
+  border-radius: var(--radius-sm);
+  background: rgba(255,255,255,0.03);
+  white-space: pre-wrap;
+}
+.feed .item .meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+/* Console log panel */
+#console {
+  width: 100%;
+  min-height: 140px;
+  max-height: 260px;
+  overflow: auto;
+  padding: var(--space-5);
+  border-radius: var(--radius-md);
+  background: var(--surface-0);
+  border: 1px solid var(--soft-bd);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* Inputs row inside console cards */
+.controls {
+  display: grid;
+  gap: var(--space-3);
+}
+.controls.inline {
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  align-items: center;
+}
+
+/* Minor helpers used by console */
+.small {
+  font-size: 12px;
+  color: var(--muted);
+}
+.hr {
+  height: 1px;
+  background: var(--card-bd);
+  margin: var(--space-6) 0;
+}
+
+/* ==========================================================================
+   End
+   ========================================================================== */

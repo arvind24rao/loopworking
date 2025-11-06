@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Loop — Four-Panel Console</title>
+  <link rel="stylesheet" href="./style.css" />
+  <style>
+    /* Page-only minimal tweaks (keeps existing look) */
+    body { background:#000; color:#fff; margin:0; }
+    main { padding: 24px; }
+    /* Small helpers for the auth strip */
+    .auth-grid { display:grid; gap:12px; grid-template-columns:1fr 1fr; }
+    .auth-fieldset { border:1px solid #333; padding:8px; border-radius:8px; }
+    .auth-fieldset textarea, .auth-fieldset input { width:100%; }
+    .auth-actions { margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .statuspill { background:#222; color:#aaa; border:1px solid #333; padding:4px 8px; border-radius:999px; font-size:12px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; }
+    .muted { color:#9aa1a6; }
+    .card { border:1px solid #222; border-radius:12px; padding:12px; background:#0b0b0b; }
+    .content { margin-top:8px; }
+    .btn { background:#1f2937; color:#fff; border:0; border-radius:8px; padding:6px 10px; cursor:pointer; }
+    .btn.blue { background:#0f3a7a; }
+    .feed, .previewBox { border:1px solid #1e1e1e; min-height:120px; padding:8px; border-radius:8px; background:#0a0a0a; }
+    .hr { height:1px; background:#1f1f1f; margin:10px 0; }
+    input, textarea { background:#0f0f0f; color:#fff; border:1px solid #222; border-radius:8px; padding:6px; }
+    label { display:grid; gap:6px; }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="row" style="justify-content:space-between; margin-bottom:16px;">
+      <div>
+        <div style="font-weight:600; font-size:18px;">Console — Full Tester</div>
+        <div class="muted" style="font-size:13px;">Send as A/B → preview updates; Refresh A/B → publish then fetch.</div>
+      </div>
+      <span id="status" class="statuspill">idle</span>
+    </header>
+
+    <!-- Auth & Tokens (paste JWTs if you want to bypass Supabase login) -->
+    <details id="authStrip" style="margin: 8px 0 16px 0;">
+      <summary>Auth & Tokens (A/B)</summary>
+      <div class="auth-grid" style="margin-top:8px;">
+        <!-- User A auth -->
+        <fieldset class="auth-fieldset">
+          <legend>User A</legend>
+          <label>JWT for A</label>
+          <textarea id="jwtA" rows="3" placeholder="Paste JWT for user A"></textarea>
+          <div class="auth-actions">
+            <button id="useJwtA" class="btn">Use JWT A</button>
+          </div>
+        </fieldset>
+
+        <!-- User B auth -->
+        <fieldset class="auth-fieldset">
+          <legend>User B</legend>
+          <label>JWT for B</label>
+          <textarea id="jwtB" rows="3" placeholder="Paste JWT for user B"></textarea>
+          <div class="auth-actions">
+            <button id="useJwtB" class="btn">Use JWT B</button>
+          </div>
+        </fieldset>
+      </div>
+
+      <!-- Optional: bot-operator token for protected bot routes -->
+      <div style="margin-top:12px;">
+        <label>Bot Operator JWT (optional)</label>
+        <textarea id="jwtOperator" rows="2" placeholder="Paste Bot Operator JWT to call protected bot endpoints"></textarea>
+        <div class="auth-actions">
+          <button id="useJwtOperator" class="btn">Use Bot Operator JWT</button>
+        </div>
+      </div>
+    </details>
+    <!-- /Auth & Tokens -->
+
+    <div class="row" style="gap:16px; align-items:flex-start; flex-wrap:wrap;">
+      <!-- Panel 1: Connection & Controls -->
+      <section class="card" style="min-width:320px; flex:1 1 360px;">
+        <h2>Connection & Controls</h2>
+        <div class="content">
+          <div class="controls">
+            <label>API Base
+              <input id="apiBase" type="url" placeholder="https://api.loopasync.com" />
+            </label>
+            <!-- NOTE: kept original proxy behaviour in app.js: /api/* will default to Netlify proxy -->
+            <div class="row">
+              <button id="saveCfgBtn" class="btn">Save</button>
+              <button id="clearCfgBtn" class="btn">Clear</button>
+              <button id="previewNowBtn" class="btn">Preview now</button>
+            </div>
+
+            <!-- Preview behaviour toggles -->
+            <div class="row" style="margin-top:8px; gap:24px; align-items:center;">
+              <label class="row" style="gap:8px; align-items:center;">
+                <input id="previewOnSend" type="checkbox" checked />
+                <span class="muted">Preview on send (LLM call)</span>
+              </label>
+              <label class="row" style="gap:8px; align-items:center;">
+                <input id="previewAfterPublish" type="checkbox" />
+                <span class="muted">Preview after publish (extra LLM call)</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel 1b: Supabase Bot Auto-Login -->
+      <section class="card" style="min-width:320px; flex:1 1 360px;">
+        <h2>Supabase Bot Auto-Login</h2>
+        <div class="content">
+          <div class="auth-grid" style="grid-template-columns: 280px 1fr;">
+            <label>Supabase URL
+              <input id="sbUrl" placeholder="https://<project-ref>...supabase.co" value="https://yayaoxjotevczzyeahjc.supabase.co" />
+            </label>
+            <label>Anon Key
+              <input id="sbAnon" placeholder="Paste your anon key" value="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlheWFveGpvdGV2Y3p6eWVhaGpjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc2NzI3NDIsImV4cCI6MjA3MzI0ODc0Mn0.jsq6FMNboaaga8YHKwZhdhayZP9EPTekj27y_beLrq0" />
+            </label>
+            <label>Bot Email
+              <input id="botEmail" placeholder="bot@loop.bot" value="bot@loop.bot" />
+            </label>
+            <label>Bot Password
+              <input id="botPass" type="password" placeholder="password" value="password" />
+            </label>
+            <label class="row" style="gap:8px; align-items:center;">
+              <input id="autoLoginBot" type="checkbox" checked /> Auto-login Bot on load
+            </label>
+          </div>
+          <div class="row" style="margin-top:8px; gap:8px; align-items:center;">
+            <button id="btnInitSupabase" class="btn blue">Init Supabase & Login Bot</button>
+            <span id="botStatus" class="muted">(not logged in)</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- NEW Panel 1c: Supabase Human Logins (A/B) -->
+      <section class="card" style="min-width:320px; flex:1 1 360px;">
+        <h2>Supabase Human Logins (A/B)</h2>
+        <div class="content">
+          <div class="auth-grid" style="grid-template-columns: 1fr 1fr;">
+            <label>A Email
+              <input id="sbEmailA" placeholder="a2@loop.test" value="a2@loop.test" />
+            </label>
+            <label>A Password
+              <input id="sbPassA" type="password" placeholder="password" value="password" />
+            </label>
+            <label>B Email
+              <input id="sbEmailB" placeholder="b2@loop.test" value="b2@loop.test" />
+            </label>
+            <label>B Password
+              <input id="sbPassB" type="password" placeholder="password" value="password" />
+            </label>
+          </div>
+          <div class="row" style="margin-top:8px; gap:8px; align-items:center;">
+            <button id="btnLoginA" class="btn">Sign in → A</button>
+            <span id="loginAStatus" class="muted">(A not logged in)</span>
+          </div>
+          <div class="row" style="margin-top:6px; gap:8px; align-items:center;">
+            <button id="btnLoginB" class="btn">Sign in → B</button>
+            <span id="loginBStatus" class="muted">(B not logged in)</span>
+          </div>
+          <div class="row" style="margin-top:6px; gap:8px; align-items:center;">
+            <label class="row" style="gap:8px; align-items:center;">
+              <input id="rememberSessions" type="checkbox" checked />
+              <span class="muted">Remember A/B sessions (localStorage)</span>
+            </label>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- NEW: Loop & Thread Selection (per-user threads) -->
+    <section class="card" style="margin-bottom:16px;">
+      <h2>Loop & Thread Selection</h2>
+      <div class="content">
+        <div class="auth-grid" style="grid-template-columns: 1fr 1fr;">
+          <label>Loop ID (optional)
+            <input id="loopId" type="text" placeholder="loop uuid (optional)" />
+          </label>
+          <div></div>
+          <label>Thread ID for A
+            <input id="threadIdA" type="text" placeholder="thread uuid for A" />
+          </label>
+          <label>Thread ID for B
+            <input id="threadIdB" type="text" placeholder="thread uuid for B" />
+          </label>
+        </div>
+        <div class="row" style="margin-top:8px; gap:8px; align-items:center;">
+          <button id="btnSaveLoopThread" class="btn">Save Loop/Threads</button>
+          <span id="loopThreadStatus" class="muted">(not set)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Two-column grid for panels -->
+    <div class="row" style="gap:16px; align-items:flex-start; flex-wrap:wrap;">
+      <!-- Panel 2: User A -->
+      <section class="card">
+        <h2>User A</h2>
+        <div class="content">
+          <div class="controls">
+            <label>User A ID
+              <input id="userAId" type="text" placeholder="profile uuid for A" />
+            </label>
+            <label>Message
+              <textarea id="userAText" placeholder="Message as A…"></textarea>
+            </label>
+            <div class="row">
+              <button id="sendABtn" class="btn">Send as A</button>
+              <button id="refreshABtn" class="btn blue">Refresh A feed</button>
+            </div>
+          </div>
+          <div class="hr"></div>
+          <div id="messagesA" class="feed">
+            <span class="muted">No messages.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel 3: User B -->
+      <section class="card">
+        <h2>User B</h2>
+        <div class="content">
+          <div class="controls">
+            <label>User B ID
+              <input id="userBId" type="text" placeholder="profile uuid for B" />
+            </label>
+            <label>Message
+              <textarea id="userBText" placeholder="Message as B…"></textarea>
+            </label>
+            <div class="row">
+              <button id="sendBBtn" class="btn">Send as B</button>
+              <button id="refreshBBtn" class="btn blue">Refresh B feed</button>
+            </div>
+          </div>
+          <div class="hr"></div>
+          <div id="messagesB" class="feed">
+            <span class="muted">No messages.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel 4: Maintenance Tools -->
+      <section class="card" style="grid-column: 1 / -1;">
+        <h2>Maintenance Tools</h2>
+        <div class="content">
+          <div class="row" style="gap:16px; align-items:center;">
+            <button id="clearA" class="btn">Clear Chat A</button>
+            <button id="clearB" class="btn">Clear Chat B</button>
+            <button id="clearBot" class="btn blue">Clear Bot Previews</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel 5: Bot → A Preview -->
+      <section class="card">
+        <h2>Bot → A Preview</h2>
+        <div class="content">
+          <div class="muted" id="botAPreviewMeta">Last preview — --:--:--</div>
+          <div id="botToAPreview" class="previewBox">
+            <span class="muted">No preview available.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel 6: Bot → B Preview -->
+      <section class="card">
+        <h2>Bot → B Preview</h2>
+        <div class="content">
+          <div class="muted" id="botBPreviewMeta">Last preview — --:--:--</div>
+          <div id="botToBPreview" class="previewBox">
+            <span class="muted">No preview available.</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Panel 7: Console Log -->
+      <section class="card" style="grid-column: 1 / -1;">
+        <h2>Console</h2>
+        <div class="content">
+          <pre id="console" aria-live="polite"></pre>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <!-- Supabase client (loaded before app.js) -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+  <script src="./app.js"></script>
+  <!-- <script src="./app.js?v=20251106"></script> -->
+</body>
+</html>
