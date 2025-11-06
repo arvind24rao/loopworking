@@ -8,7 +8,8 @@
 (function () {
   // ----------------------- Config Defaults -----------------------
   const DEFAULTS = {
-    API_BASE: 'https://loopasync.com', // Netlify proxy to backend
+    // API_BASE: 'https://loopasync.com', // Netlify proxy to backend
+    API_BASE: 'https://loop-f3oe.onrender.com',
     LOOP_ID: 'bc52f715-1ba2-4c47-908f-51dc70e79e5d',
     THREAD_ID_SHARED: '80770009-d6a9-490b-a531-293132175827',
     // Known A/B profile UUIDs (will be overwritten by Supabase login response anyway)
